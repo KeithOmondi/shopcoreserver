@@ -4,6 +4,7 @@ import { createLogger } from './infra/logger.js';
 import { registry } from './infra/metrics.js';
 import { Database } from './infra/db.js';
 import { OrderRepository, OrderService } from './modules/orders/orders.js';
+import { DispatchService } from './modules/dispatch/dispatch.js';
 import { KafkaPublisher, LogPublisher, OutboxRelay } from './workers/outbox-relay.js';
 
 /**
@@ -11,6 +12,7 @@ import { KafkaPublisher, LogPublisher, OutboxRelay } from './workers/outbox-rela
  * affected by batch work, and each scales independently):
  *   - outbox relay (leader-elected)
  *   - expiry of unpaid orders (releases reserved stock)
+ *   - expiry of unanswered rider offers
  *   - purge of expired idempotency keys
  */
 async function main() {
@@ -23,6 +25,7 @@ async function main() {
   if (!cfg.KAFKA_BROKERS) log.warn('KAFKA_BROKERS not set: using log publisher (development only)');
   const relay = new OutboxRelay(db.writer, publisher, cfg, log);
   const orders = new OrderService(db, new OrderRepository());
+  const dispatch = new DispatchService(db);
 
   const timers: NodeJS.Timeout[] = [];
   const every = (ms: number, name: string, fn: () => Promise<unknown>) => {
@@ -46,6 +49,11 @@ async function main() {
     let total = 0;
     for (let n = -1; n !== 0; total += n) n = await orders.expireUnpaid(cfg.ORDER_PAYMENT_TIMEOUT_MIN);
     if (total) log.info({ cancelled: total }, 'expired unpaid orders');
+  });
+  // Rider offers nobody answered within 75 seconds go back to the dispatch board.
+  every(10_000, 'expire-offers', async () => {
+    const n = await dispatch.expireOffers();
+    if (n) log.info({ expired: n }, 'expired rider offers');
   });
   every(60_000, 'purge-idempotency', async () => {
     // Batched delete keeps each transaction short and avoids long locks / WAL spikes.

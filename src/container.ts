@@ -9,6 +9,17 @@ import { LoadShedder } from './http/load-shedding.js';
 import { ProductRepository, ProductService, type Product, type ProductPage } from './modules/products/products.js';
 import { OrderRepository, OrderService } from './modules/orders/orders.js';
 import { StaffService } from './modules/staff/staff.js';
+import { CatalogService } from './modules/catalog/catalog.js';
+import { InventoryService } from './modules/inventory/inventory.js';
+import { PurchasingService } from './modules/inventory/purchasing.js';
+import { WarehouseService } from './modules/inventory/warehouse.js';
+import { AdminOrdersService, CustomersService } from './modules/orders/admin-orders.js';
+import { ZonesService } from './modules/dispatch/zones.js';
+import { RidersService, consoleSms } from './modules/dispatch/riders.js';
+import { DispatchService } from './modules/dispatch/dispatch.js';
+import { RiderMoneyService } from './modules/dispatch/money.js';
+import { SupportService } from './modules/support/support.js';
+import { ClaimsService } from './modules/support/claims.js';
 import type { AppDeps } from './http/app.js';
 
 /**
@@ -47,6 +58,18 @@ export async function createContainer(cfg: Config, log: Logger): Promise<Contain
   const orders = new OrderService(db, new OrderRepository());
 
   const staff = new StaffService(db, cfg, log);
+  const catalog = new CatalogService(db, products);
+  const inventory = new InventoryService(db);
+  const purchasing = new PurchasingService(db);
+  const warehouse = new WarehouseService(db);
+  const adminOrders = new AdminOrdersService(db);
+  const customers = new CustomersService(db);
+  const zones = new ZonesService(db);
+  const riders = new RidersService(db, cfg, consoleSms(log));
+  const dispatch = new DispatchService(db);
+  const riderMoney = new RiderMoneyService(db);
+  const support = new SupportService(db);
+  const claims = new ClaimsService(db);
 
   // Verify connectivity once at boot, so a misconfigured pod never becomes Ready.
   await db.ping();
@@ -63,6 +86,18 @@ export async function createContainer(cfg: Config, log: Logger): Promise<Contain
     products,
     orders,
     staff,
+    catalog,
+    inventory,
+    purchasing,
+    warehouse,
+    adminOrders,
+    customers,
+    zones,
+    riders,
+    dispatch,
+    riderMoney,
+    support,
+    claims,
     health: {
       // Readiness reflects *this pod's* ability to serve; it deliberately does not
       // ping shared dependencies on every probe, otherwise one database blip would mark

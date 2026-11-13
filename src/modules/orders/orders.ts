@@ -1,3 +1,5 @@
+import { sell, restock } from '../inventory/stock.js';
+import { deliverySettings, feeFor } from '../dispatch/zones.js';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import type pg from 'pg';
@@ -42,6 +44,8 @@ export interface OrderItem {
 
 export interface Order {
   id: string;
+  /** Human-friendly number shown to customers and staff. */
+  orderNumber: string;
   userId: string;
   status: OrderStatus;
   totalCents: number;
@@ -65,6 +69,16 @@ export const makeCreateOrderSchema = (cfg: Pick<Config, 'ORDER_MAX_LINES' | 'ORD
       .min(1)
       .max(cfg.ORDER_MAX_LINES)
       .refine((items) => new Set(items.map((i) => i.productId)).size === items.length, 'duplicate productId'),
+    paymentMethod: z.enum(['mpesa', 'card', 'cod']).optional(),
+    /** Where to deliver, and who to call. Also fills in the customer's profile the first time. */
+    delivery: z
+      .strictObject({
+        name: z.string().trim().min(1).max(120),
+        phone: z.string().trim().min(5).max(32),
+        area: z.string().trim().max(80).default(''),
+        address: z.string().trim().min(1).max(200),
+      })
+      .optional(),
   });
 
 export type CreateOrderInput = z.infer<ReturnType<typeof makeCreateOrderSchema>>;
@@ -80,11 +94,13 @@ export function requestHash(input: CreateOrderInput): string {
     .sort((a, b) => (a.productId < b.productId ? -1 : a.productId > b.productId ? 1 : 0))
     .map((i) => `${i.productId}:${i.quantity}`)
     .join(',');
-  return createHash('sha256').update(canonical).digest('hex');
+  const extra = input.delivery || input.paymentMethod ? `|${input.paymentMethod ?? ''}|${input.delivery ? JSON.stringify(input.delivery) : ''}` : '';
+  return createHash('sha256').update(canonical + extra).digest('hex');
 }
 
 interface OrderRow {
   id: string;
+  order_no: number;
   user_id: string;
   status: OrderStatus;
   total_cents: number;
@@ -103,10 +119,11 @@ interface ItemRow {
   unit_price_cents: number;
 }
 
-const ORDER_COLS = 'id, user_id, status, total_cents, currency, item_count, version, created_at, updated_at';
+const ORDER_COLS = 'id, order_no, user_id, status, total_cents, currency, item_count, version, created_at, updated_at';
 
 const toOrder = (o: OrderRow, items: ItemRow[]): Order => ({
   id: o.id,
+  orderNumber: `SC-${o.order_no}`,
   userId: o.user_id,
   status: o.status,
   totalCents: o.total_cents,
@@ -254,16 +271,26 @@ export class OrderService {
           const p = byId.get(i.productId)!;
           return { lineNo: idx + 1, p, quantity: i.quantity };
         });
-        const total = lines.reduce((sum, l) => sum + l.p.price_cents * l.quantity, 0);
+        const subtotal = lines.reduce((sum, l) => sum + l.p.price_cents * l.quantity, 0);
+        // Delivery fee: only when the order says where it is going (the zone’s fee, or the base fee).
+        let fee = 0;
+        let zoneId: string | null = null;
+        if (input.delivery) {
+          const s = await deliverySettings(c);
+          if (subtotal < s.minBasketCents) throw new UnprocessableError('BELOW_MINIMUM_BASKET', 'The basket is below the minimum for delivery', { minBasketCents: s.minBasketCents });
+          ({ zoneId, feeCents: fee } = await feeFor(c, input.delivery.area));
+        }
+        const total = subtotal + fee;
         if (!Number.isSafeInteger(total)) throw new UnprocessableError('TOTAL_OVERFLOW', 'Order total too large');
         const itemCount = lines.reduce((s, l) => s + l.quantity, 0);
         const currency = products.rows[0]!.currency;
 
         const o = await c.query<OrderRow>(
-          `INSERT INTO orders (id, user_id, status, total_cents, currency, item_count)
-           VALUES ($1,$2,'PENDING_PAYMENT',$3,$4,$5) RETURNING ${ORDER_COLS}`,
-          [orderId, userId, total, currency, itemCount],
+          `INSERT INTO orders (id, user_id, status, total_cents, currency, item_count, payment_method, delivery_name, delivery_phone, delivery_area, delivery_address, subtotal_cents, delivery_fee_cents, zone_id)
+           VALUES ($1,$2,'PENDING_PAYMENT',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING ${ORDER_COLS}`,
+          [orderId, userId, total, currency, itemCount, input.paymentMethod ?? null, input.delivery?.name ?? null, input.delivery?.phone ?? null, input.delivery?.area ?? null, input.delivery?.address ?? null, subtotal, fee, zoneId],
         );
+        await this.touchCustomer(c, userId, input.delivery);
         const items = await c.query<ItemRow>(
           `INSERT INTO order_items (order_id, line_no, product_id, sku, name, quantity, unit_price_cents)
            SELECT $1, * FROM unnest($2::smallint[], $3::uuid[], $4::text[], $5::text[], $6::int[], $7::bigint[])
@@ -297,6 +324,20 @@ export class OrderService {
             .filter((i) => (avail.get(i.productId) ?? 0) < i.quantity)
             .map((i) => ({ productId: i.productId, requested: i.quantity, available: avail.get(i.productId) ?? 0 }));
           throw new ConflictError('INSUFFICIENT_STOCK', 'Insufficient stock', { items: short });
+        }
+        // Cash on delivery is confirmed on the spot: the stock leaves the shelf now and the rider collects the money at the door.
+        if (input.paymentMethod === 'cod') {
+          await c.query(
+            `UPDATE inventory i SET reserved = i.reserved - v.qty, updated_at = now() FROM unnest($1::uuid[], $2::int[]) AS v(id, qty) WHERE i.product_id = v.id`,
+            [ids, qtyFor(input, ids)],
+          );
+          await c.query(
+            `UPDATE orders SET status = 'PAID', payment_ref = $2, cod_due_cents = total_cents, paid_at = now(), version = version + 1, updated_at = now() WHERE id = $1`,
+            [orderId, `COD-SC-${o.rows[0]!.order_no}`],
+          );
+          await sell(c, order.items, `SC-${o.rows[0]!.order_no}`);
+          await outbox(c, 'order', orderId, 'OrderPaid', { orderId, paymentRef: `COD-SC-${o.rows[0]!.order_no}`, amountCents: total, currency, method: 'cod' });
+          return { order: (await this.repo.load(c, orderId))!, replayed: false };
         }
         return { order, replayed: false };
       });
@@ -348,12 +389,27 @@ export class OrderService {
       const order = await this.repo.load(c, id, true);
       if (!order || (order.userId !== requester.sub && !requester.isAdmin)) throw new NotFoundError('Order');
       assertTransition(order.status, 'CANCELLED');
-      const refundRequired = order.status === 'PAID';
-      const paymentRef = refundRequired ? await this.paymentRef(c, id) : null;
-      await this.releaseStock(c, order);
-      const updated = await this.setStatus(c, order, 'CANCELLED');
+      // Everything that doesn't need the (hot) inventory row is done first, so that lock is held for as short a time as possible.
+      let refundRequired = false;
+      let paymentRef: string | null = null;
+      if (order.status === 'PAID') {
+        const p = (await c.query<{ cod: boolean; collected: boolean; payment_ref: string | null }>(
+          'SELECT (cod_due_cents IS NOT NULL) AS cod, (cod_collected_at IS NOT NULL) AS collected, payment_ref FROM orders WHERE id = $1', [id])).rows[0]!;
+        // Cash orders have taken no money until the rider collects it, so there is nothing to refund before then.
+        refundRequired = !p.cod || p.collected;
+        paymentRef = refundRequired ? p.payment_ref : null;
+        // An offer nobody accepted just disappears; a rider already on the job shows up under exceptions so dispatch can tell them.
+        await c.query(
+          `UPDATE deliveries SET status = CASE WHEN status = 'offered' THEN 'cancelled' ELSE 'failed' END,
+                  failure_kind = CASE WHEN status = 'offered' THEN NULL ELSE 'Cancelled' END, failure_reason = CASE WHEN status = 'offered' THEN NULL ELSE $2 END,
+                  failed_at = CASE WHEN status = 'offered' THEN NULL ELSE now() END, version = version + 1
+            WHERE order_id = $1 AND status IN ('offered','accepted','at_pickup','picked_up','at_dropoff')`, [id, reason]);
+      }
+      const updated = await this.setStatus(c, order, 'CANCELLED', reason);
       await outbox(c, 'order', id, 'OrderCancelled', { orderId: id, reason, refundRequired, paymentRef });
       await audit(c, { id: requester.sub, requestId: requester.requestId }, 'order.cancel', 'order', id, { reason, refundRequired });
+      // Stock last: the inventory row is the contended resource, so it is locked only for the final statements before COMMIT.
+      await this.releaseStock(c, order);
       return updated;
     });
   }
@@ -406,6 +462,7 @@ export class OrderService {
           [ids, ids.map((pid) => order.items.find((i) => i.productId === pid)!.quantity)],
         );
         await c.query('UPDATE orders SET payment_ref = $2 WHERE id = $1', [id, pay.paymentRef]);
+        await sell(c, order.items, await this.orderRef(c, id));
         const updated = await this.setStatus(c, order, 'PAID');
         await outbox(c, 'order', id, 'OrderPaid', {
           orderId: id,
@@ -486,6 +543,27 @@ export class OrderService {
     return cancelled;
   }
 
+  /** Make sure the buyer has a profile; the first delivery details fill in anything still blank. */
+  private async touchCustomer(c: Queryable, userId: string, d?: { name: string; phone: string; area: string; address: string }) {
+    if (!d) {
+      await c.query('INSERT INTO customers (id) VALUES ($1) ON CONFLICT (id) DO NOTHING', [userId]);
+      return;
+    }
+    await c.query(
+      `INSERT INTO customers (id, name, phone, area, street) VALUES ($1,$2,$3,$4,$5)
+       ON CONFLICT (id) DO UPDATE SET name = CASE WHEN customers.name = '' THEN EXCLUDED.name ELSE customers.name END,
+         phone = CASE WHEN customers.phone = '' THEN EXCLUDED.phone ELSE customers.phone END,
+         area = CASE WHEN customers.area = '' THEN EXCLUDED.area ELSE customers.area END,
+         street = CASE WHEN customers.street = '' THEN EXCLUDED.street ELSE customers.street END`,
+      [userId, d.name, d.phone, d.area, d.address],
+    );
+  }
+
+  private async orderRef(c: Queryable, id: string): Promise<string> {
+    const { rows } = await c.query<{ order_no: number }>('SELECT order_no FROM orders WHERE id = $1', [id]);
+    return rows[0] ? `SC-${rows[0].order_no}` : id;
+  }
+
   private async paymentRef(c: Queryable, id: string): Promise<string | null> {
     const { rows } = await c.query<{ payment_ref: string | null }>('SELECT payment_ref FROM orders WHERE id = $1', [id]);
     return rows[0]?.payment_ref ?? null;
@@ -499,6 +577,8 @@ export class OrderService {
     const ids = order.items.map((i) => i.productId).sort();
     await this.repo.lockInventory(c, ids);
     const fromReserved = order.status === 'PENDING_PAYMENT';
+    // Paid orders had already left the shelves: put them back.
+    if (!fromReserved) await restock(c, order.items, await this.orderRef(c, order.id), 'Return restock', 'Order cancelled after payment');
     await c.query(
       `UPDATE inventory i SET available = i.available + v.qty,
               reserved = i.reserved - CASE WHEN $3::boolean THEN v.qty ELSE 0 END, updated_at = now()
@@ -507,10 +587,15 @@ export class OrderService {
     );
   }
 
-  private async setStatus(c: pg.PoolClient, order: Order, to: OrderStatus): Promise<Order> {
+  private async setStatus(c: pg.PoolClient, order: Order, to: OrderStatus, cancelReason?: string): Promise<Order> {
     const { rowCount } = await c.query(
-      'UPDATE orders SET status = $2, version = version + 1, updated_at = now() WHERE id = $1 AND version = $3',
-      [order.id, to, order.version],
+      `UPDATE orders SET status = $2, version = version + 1, updated_at = now(),
+              paid_at = CASE WHEN $2 = 'PAID' THEN now() ELSE paid_at END,
+              fulfilled_at = CASE WHEN $2 = 'FULFILLED' THEN now() ELSE fulfilled_at END,
+              cancelled_at = CASE WHEN $2 = 'CANCELLED' THEN now() ELSE cancelled_at END,
+              cancel_reason = COALESCE($4, cancel_reason)
+        WHERE id = $1 AND version = $3`,
+      [order.id, to, order.version, cancelReason ?? null],
     );
     if (!rowCount) throw new ConflictError('VERSION_CONFLICT', 'Order was modified concurrently');
     return (await this.repo.load(c, order.id))!;

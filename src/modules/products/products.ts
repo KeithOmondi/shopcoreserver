@@ -2,9 +2,10 @@ import { z } from 'zod';
 import type { Logger } from 'pino';
 import type { Database, Queryable } from '../../infra/db.js';
 import type { ReadThroughCache } from '../../infra/cache.js';
-import { ConflictError, NotFoundError, UnprocessableError, ValidationError } from '../../domain/errors.js';
+import { ConflictError, NotFoundError, ValidationError } from '../../domain/errors.js';
 import { isUuid, uuidv7 } from '../../infra/uuid.js';
 import { decodeCursor, encodeCursor } from '../../http/pagination.js';
+import { applyMoves, primaryLocation } from '../inventory/stock.js';
 
 export interface Product {
   id: string;
@@ -45,6 +46,8 @@ export const UpdateProductSchema = z
 export const AdjustStockSchema = z.strictObject({
   delta: z.number().int().min(-10_000_000).max(10_000_000).refine((n) => n !== 0, 'delta must be non-zero'),
   reason: z.string().trim().min(3).max(200),
+  /** Where the stock is. Defaults to the primary location. */
+  locationId: z.string().refine(isUuid, 'must be a UUID').optional(),
 });
 
 export const ListQuerySchema = z.object({
@@ -102,6 +105,7 @@ export class ProductRepository {
 export interface Actor {
   id: string;
   requestId: string;
+  name?: string;
 }
 
 export class ProductService {
@@ -137,6 +141,12 @@ export class ProductService {
     return page!;
   }
 
+  /** Drop cached copies after the admin changes a product. */
+  async invalidate(id: string): Promise<void> {
+    await this.cache.invalidate(id);
+    await this.listCache.flush();
+  }
+
   async availability(id: string): Promise<{ productId: string; available: number }> {
     const available = await this.db.read((c) => this.repo.availability(c, id));
     if (available === null) throw new NotFoundError('Product');
@@ -152,7 +162,10 @@ export class ProductService {
            VALUES ($1,$2,$3,$4,$5,$6) RETURNING ${COLS}`,
           [id, input.sku, input.name, input.description, input.priceCents, input.currency],
         );
-        await c.query('INSERT INTO inventory (product_id, available) VALUES ($1, $2)', [id, input.initialStock]);
+        await c.query('INSERT INTO inventory (product_id, available) VALUES ($1, 0)', [id]);
+        if (input.initialStock > 0) {
+          await applyMoves(c, [{ productId: id, locationId: await primaryLocation(c), delta: input.initialStock, type: 'Opening stock', ref: 'NEW-PRODUCT' }], { id: actor.id, name: actor.name ?? 'Staff' });
+        }
         await audit(c, actor, 'product.create', 'product', id, input);
         await outbox(c, 'product', id, 'ProductCreated', toProduct(rows[0]!));
         return toProduct(rows[0]!);
@@ -197,19 +210,14 @@ export class ProductService {
 
   async adjustStock(id: string, input: z.infer<typeof AdjustStockSchema>, actor: Actor) {
     return this.db.tx(async (c) => {
-      const { rows } = await c.query<{ available: number }>(
-        `UPDATE inventory SET available = available + $2, updated_at = now()
-         WHERE product_id = $1 AND available + $2 >= 0 RETURNING available`,
-        [id, input.delta],
-      );
-      if (!rows[0]) {
-        const exists = await c.query('SELECT 1 FROM inventory WHERE product_id = $1', [id]);
-        if (!exists.rowCount) throw new NotFoundError('Product');
-        throw new UnprocessableError('NEGATIVE_STOCK', 'Adjustment would make stock negative');
-      }
+      const exists = await c.query('SELECT 1 FROM inventory WHERE product_id = $1 FOR UPDATE', [id]);
+      if (!exists.rowCount) throw new NotFoundError('Product');
+      const locationId = input.locationId ?? (await primaryLocation(c));
+      await applyMoves(c, [{ productId: id, locationId, delta: input.delta, type: input.delta < 0 && /damage|lost|expire|write/i.test(input.reason) ? 'Write-off' : 'Adjustment', ref: 'ADJUSTMENT', note: input.reason }], { id: actor.id, name: actor.name ?? 'Staff' });
+      const { rows } = await c.query<{ available: number }>('SELECT available FROM inventory WHERE product_id = $1', [id]);
       await audit(c, actor, 'inventory.adjust', 'product', id, input);
-      await outbox(c, 'inventory', id, 'StockAdjusted', { productId: id, ...input, available: rows[0].available });
-      return { productId: id, available: rows[0].available };
+      await outbox(c, 'inventory', id, 'StockAdjusted', { productId: id, ...input, available: rows[0]!.available });
+      return { productId: id, available: rows[0]!.available };
     });
   }
 }

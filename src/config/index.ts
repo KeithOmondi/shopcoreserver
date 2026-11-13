@@ -60,6 +60,10 @@ const schema = z.object({
   STAFF_SESSION_TTL_S: z.coerce.number().int().min(900).default(12 * 3600),
   STAFF_LOCK_ATTEMPTS: z.coerce.number().int().min(3).max(20).default(5),
   STAFF_LOCK_MINUTES: z.coerce.number().int().min(1).max(1440).default(15),
+  // Rider app sign-in (same signing key as staff). RIDER_DEV_OTP fixes the SMS code for demos; ignored in production.
+  RIDER_ACCESS_TTL_S: z.coerce.number().int().min(60).max(86400).default(3600),
+  RIDER_SESSION_TTL_S: z.coerce.number().int().min(3600).default(30 * 86400),
+  RIDER_DEV_OTP: z.string().regex(/^\d{6}$/).optional(),
 
   // Rate limiting (per principal, token bucket)
   RATE_LIMIT_ENABLED: bool.default(true),

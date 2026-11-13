@@ -11,6 +11,20 @@ import { bearer, requirePrincipal, requireRole, type TokenVerifier } from './aut
 import { IdParam, parse } from './validate.js';
 import { makeAuthz, registerStaffRoutes } from './staff-routes.js';
 import type { StaffService } from '../modules/staff/staff.js';
+import type { CatalogService } from '../modules/catalog/catalog.js';
+import type { InventoryService } from '../modules/inventory/inventory.js';
+import { registerAdminRoutes } from './admin-routes.js';
+import { registerFieldRoutes } from './field-routes.js';
+import { registerSupportRoutes } from './support-routes.js';
+import type { SupportService } from '../modules/support/support.js';
+import type { ClaimsService } from '../modules/support/claims.js';
+import type { ZonesService } from '../modules/dispatch/zones.js';
+import type { RidersService } from '../modules/dispatch/riders.js';
+import type { DispatchService } from '../modules/dispatch/dispatch.js';
+import type { RiderMoneyService } from '../modules/dispatch/money.js';
+import type { AdminOrdersService, CustomersService } from '../modules/orders/admin-orders.js';
+import type { PurchasingService } from '../modules/inventory/purchasing.js';
+import type { WarehouseService } from '../modules/inventory/warehouse.js';
 import { FailureThrottle, type BucketSpec, type RateLimiter } from './rate-limiter.js';
 import type { LoadShedder } from './load-shedding.js';
 import {
@@ -31,6 +45,18 @@ export interface AppDeps {
   products: ProductService;
   orders: OrderService;
   staff: StaffService;
+  catalog: CatalogService;
+  inventory: InventoryService;
+  purchasing: PurchasingService;
+  warehouse: WarehouseService;
+  adminOrders: AdminOrdersService;
+  customers: CustomersService;
+  zones: ZonesService;
+  riders: RidersService;
+  dispatch: DispatchService;
+  riderMoney: RiderMoneyService;
+  support: SupportService;
+  claims: ClaimsService;
   health: { ready: () => boolean; deps: () => Promise<Record<string, string>> };
 }
 
@@ -62,7 +88,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   if (origins.length) {
     await app.register(cors, {
       origin: origins,
-      methods: ['GET', 'POST', 'PATCH', 'DELETE'],
+      methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
       allowedHeaders: ['Authorization', 'Content-Type', 'Idempotency-Key', 'If-Match', 'X-Request-Id'],
       maxAge: 600,
     });
@@ -195,6 +221,9 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   const actorOf = (req: FastifyRequest) => ({ id: requirePrincipal(req).sub, requestId: String(req.id) });
   const authz = makeAuthz(deps.staff);
   registerStaffRoutes(app, deps.staff, authz);
+  registerFieldRoutes(app, { zones: deps.zones, riders: deps.riders, dispatch: deps.dispatch, riderMoney: deps.riderMoney, customers: deps.customers }, authz);
+  registerSupportRoutes(app, { support: deps.support, claims: deps.claims, riders: deps.riders }, authz);
+  registerAdminRoutes(app, { catalog: deps.catalog, inventory: deps.inventory, purchasing: deps.purchasing, warehouse: deps.warehouse, adminOrders: deps.adminOrders, customers: deps.customers }, authz);
 
   // ---- catalog (public reads) ---------------------------------------------
   app.get('/v1/products', async (req, reply) => {

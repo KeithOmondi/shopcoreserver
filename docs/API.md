@@ -105,3 +105,62 @@ Inventory › Edit, fulfilment needs Orders › Edit. Service tokens with the `a
 
 First run: `npm run staff -- bootstrap "Owner Name" owner@example.com` prints a one-time password. For development only,
 `npm run staff -- demo` creates the 18-person demo team (password `ShopCore#2025`).
+
+## Admin: catalogue, stock, purchasing, orders (permission-checked)
+
+All under `/v1/admin`, staff tokens only; each route needs one module permission (shown). `If-Match: "<version>"` is required to edit a product.
+
+| Area | Endpoints | Needs |
+|---|---|---|
+| Locations | `GET/POST /locations`, `PATCH /locations/:id` (`{primary:true}` makes it the default; a location holding stock can't be switched off) | Inventory (Purchasing for read) |
+| Categories, brands | `GET/POST /categories`, `PATCH/DELETE /categories/:id`, same for `/brands` (a category in use can't be deleted) | Products |
+| Suppliers | `GET/POST /suppliers`, `PATCH /suppliers/:id` | Purchasing (Products for read) |
+| Products | `GET /products?q&categoryId&status&stock=in\|low\|out`, `GET/PATCH /products/:id`, `POST /products` (with `initialStock`, `locationId`) | Products |
+| Stock | `GET /stock/overview \| levels \| movements \| alerts`, `POST /stock/adjust`, `POST /stock/transfer`, `PUT /stock/alert-rules` | Inventory |
+| Purchase orders | `GET/POST /purchase-orders`, `PUT /:id` (drafts), `POST /:id/actions {approve\|send\|cancel}`, `POST /:id/receive`, `GET /purchase-orders/stats` | Purchasing (receive: Inventory or Purchasing Edit) |
+| Stock counts | `GET/POST /stock-counts`, `POST /:id/entries`, `/submit`, `/approve` | Inventory |
+| Returns, packing | `GET/POST /warehouse-returns`, `POST /:id/decision`; `GET /packing`, `POST /packing/:orderId/pick \| pack` | Inventory / Orders Edit |
+| Orders | `GET /orders?q&status&payment&method&from&to&customerId`, `GET /orders/:id` (timeline + notes), `POST /orders/:id/notes`, `GET /orders/stats` | Orders |
+| Customers | `GET /customers?q&segment`, `GET/PATCH /customers/:id`, `POST /customers/:id/notes` | Customers |
+
+Staff cancel or ship an order with the existing `POST /v1/orders/:id/cancel` / `/fulfillment` (Orders › Edit).
+Shoppers: `GET/PUT /v1/customers/me`; `POST /v1/orders` now also accepts `paymentMethod` and `delivery {name, phone, area, address}`.
+
+**Stock model.** Per-location `stock_levels` always sum to `inventory.available + inventory.reserved`; every change goes through one
+engine and is recorded in the append-only `stock_movements` log with a running balance. Paying an order takes its units off the
+shelf (primary location first), cancelling a paid order returns them. **Maker-checker:** the person who raised a purchase order
+over the limit (default KES 100,000, setting `purchasing.approval_limit_cents`) or ran a stock count can't approve it; the owner can.
+
+## Riders, dispatch and delivery money
+
+**Zones and fees.** `GET/POST /v1/admin/zones`, `PATCH/DELETE /zones/:id`, `PUT /v1/admin/delivery-settings` (base fee, minimum basket; Settings › Edit).
+An order that carries `delivery.area` gets that zone's fee (or the base fee) added to its total, and is refused below the minimum basket.
+The rider earns the fee minus the zone's commission %. **Cash on delivery** (`paymentMethod: "cod"`) is confirmed at once: stock leaves the shelf,
+`cod_due_cents` is set, and nothing counts as paid until the rider collects the cash.
+
+**Rider app** (`/v1/rider/...`, rider tokens): `auth/code → auth/verify → auth/register` (SMS code; `RIDER_DEV_OTP` fixes it in development), `auth/login|refresh|logout|reset`,
+`GET me`, `PUT me/documents/:key`, `PUT availability`, `POST location`, `GET offers`, `POST offers/:id/accept|decline`, `GET active`,
+`POST deliveries/:id/stage {at_pickup|picked_up|at_dropoff}`, `POST deliveries/:id/deliver {code, cashCents?, photoRef?}`, `POST deliveries/:id/fail {reason}`,
+`GET history`, `GET earnings`, `POST withdrawals {amountCents}`, `POST incidents {type, sos?}`. Pending, rejected and paused riders can sign in to see their status but cannot work.
+Shoppers follow a delivery with `GET /v1/orders/:id/delivery`; the 4-digit handover code appears only once the parcel is on the road.
+
+**Staff** (`/v1/admin/...`): riders (Riders), `riders/:id/actions {approve|reject|suspend|reinstate}`, `riders/:id/documents/:key`, `shifts`;
+dispatch (Dispatch): `dispatch/board`, `dispatch/orders/:id/suggestions|history|assign|unassign` (an assignment is an offer the rider has 75 s to accept; `force:true` assigns outright),
+`exceptions` (+ `/resolve`), `incidents`; money (Payments): `payouts` (+ `/paid`, `/failed`), `cash` (+ `/:riderId/deposit`), `riders/:id/adjustments`, `riders/:id/ledger`.
+Rider earnings and cash are append-only ledgers; a withdrawal sets the money aside immediately and a failed payout puts it back.
+
+## Support: tickets, chat, claims, reviews, help centre
+
+**Staff** (`/v1/admin/...`). *Support module:* `support/overview`, `support/agents`, `tickets` (`?q&status&priority&kind&assignee=me|none|<id>&sla=breached|risk`),
+`tickets/:id` (+ `/reply {text, internal}`, `/assign`, `/status`), `chats` (+ `/:id/messages|take|close`), `reviews` (+ `/:id/reply|state`),
+`articles`, `help/missed-searches`, `canned-replies` (+ `/:id/use`). *Claims module:* `refunds` (+ `/:id/decision|notes`), `returns` (+ `/:id/decision`), `disputes` (+ `/:id/escalate|resolve`).
+A ticket's SLA is a first-reply time by priority (urgent 15 min, high 1 h, normal 4 h, low 24 h); `breached` and `atRisk` are worked out on read.
+
+**Refund rules.** The order must be paid (cash orders: once the rider has collected); the amount can't exceed what is still refundable; one undecided request per order.
+Above KES 5,000 (`support.refund_limit_cents`) the decider also needs Payments › Edit. Approval adds to `orders.refunded_cents` and emits a `RefundApproved` event
+for the payment service to send the money back. **Returns:** approving one puts the item in the warehouse queue (`/v1/admin/warehouse-returns`) exactly once.
+Resolving a dispute for the customer can open a refund for what is still owed.
+
+**Shoppers:** `POST/GET /v1/support/tickets` (+ `/:id`, `/:id/messages`, `/:id/rating`), `GET /v1/support/chat`, `POST /v1/support/chat/messages`,
+`POST /v1/orders/:id/returns | refund-requests | review` (delivered orders; returns within 14 days), `GET /v1/support/claims`, and the public `GET /v1/help/articles?q=` / `/:id`
+(searches that find nothing are remembered). **Riders:** `POST/GET /v1/rider/support/tickets` (+ `/:id`, `/:id/messages`).

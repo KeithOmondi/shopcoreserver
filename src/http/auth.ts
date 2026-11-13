@@ -4,7 +4,7 @@ import type { Config } from '../config/index.js';
 import { ForbiddenError, UnauthorizedError } from '../domain/errors.js';
 import { isUuid, uuidFromName } from '../infra/uuid.js';
 
-export type Role = 'customer' | 'admin' | 'payments' | 'staff';
+export type Role = 'customer' | 'admin' | 'payments' | 'staff' | 'rider';
 
 export interface Principal {
   sub: string;
@@ -19,7 +19,7 @@ declare module 'fastify' {
   }
 }
 
-const KNOWN_ROLES: ReadonlySet<string> = new Set(['customer', 'admin', 'payments', 'staff']);
+const KNOWN_ROLES: ReadonlySet<string> = new Set(['customer', 'admin', 'payments', 'staff', 'rider']);
 
 /**
  * Stateless bearer-token authentication. Tokens are issued by the identity provider
@@ -84,7 +84,7 @@ export class TokenVerifier {
     for (const r of list) if (typeof r === 'string' && KNOWN_ROLES.has(r)) roles.add(r as Role);
     if (roles.size === 0) roles.add('customer');
     const sid = (payload as Record<string, unknown>).sid;
-    return { sub, roles, sid: roles.has('staff') && typeof sid === 'string' ? sid : undefined };
+    return { sub, roles, sid: (roles.has('staff') || roles.has('rider')) && typeof sid === 'string' ? sid : undefined };
   }
 }
 
