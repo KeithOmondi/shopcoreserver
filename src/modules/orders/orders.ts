@@ -1,3 +1,4 @@
+import { priceBasket, recordRedemption, releaseRedemption } from '../marketing/promotions.js';
 import { sell, restock } from '../inventory/stock.js';
 import { deliverySettings, feeFor } from '../dispatch/zones.js';
 import { createHash } from 'node:crypto';
@@ -79,6 +80,8 @@ export const makeCreateOrderSchema = (cfg: Pick<Config, 'ORDER_MAX_LINES' | 'ORD
         address: z.string().trim().min(1).max(200),
       })
       .optional(),
+    /** A promotion code; the discount is worked out at checkout, never trusted from the client. */
+    couponCode: z.string().trim().toUpperCase().max(40).optional(),
   });
 
 export type CreateOrderInput = z.infer<ReturnType<typeof makeCreateOrderSchema>>;
@@ -260,7 +263,8 @@ export class OrderService {
           price_cents: number;
           currency: string;
           active: boolean;
-        }>('SELECT id, sku, name, price_cents, currency, active FROM products WHERE id = ANY($1::uuid[])', [ids]);
+          category_id: string | null;
+        }>('SELECT id, sku, name, price_cents, currency, active, category_id FROM products WHERE id = ANY($1::uuid[])', [ids]);
         const byId = new Map(products.rows.map((p) => [p.id, p]));
         const missing = ids.filter((id) => !byId.get(id)?.active);
         if (missing.length) throw new UnprocessableError('PRODUCT_UNAVAILABLE', 'Some products are unavailable', { productIds: missing });
@@ -271,29 +275,33 @@ export class OrderService {
           const p = byId.get(i.productId)!;
           return { lineNo: idx + 1, p, quantity: i.quantity };
         });
-        const subtotal = lines.reduce((sum, l) => sum + l.p.price_cents * l.quantity, 0);
+        const listSubtotal = lines.reduce((sum, l) => sum + l.p.price_cents * l.quantity, 0);
         // Delivery fee: only when the order says where it is going (the zone’s fee, or the base fee).
         let fee = 0;
         let zoneId: string | null = null;
         if (input.delivery) {
           const s = await deliverySettings(c);
-          if (subtotal < s.minBasketCents) throw new UnprocessableError('BELOW_MINIMUM_BASKET', 'The basket is below the minimum for delivery', { minBasketCents: s.minBasketCents });
+          if (listSubtotal < s.minBasketCents) throw new UnprocessableError('BELOW_MINIMUM_BASKET', 'The basket is below the minimum for delivery', { minBasketCents: s.minBasketCents });
           ({ zoneId, feeCents: fee } = await feeFor(c, input.delivery.area));
         }
-        const total = subtotal + fee;
+        // Sale prices, bundle offers and the coupon are worked out here, on the server, from live data.
+        const pricing = await priceBasket(c, userId, lines.map((l) => ({ productId: l.p.id, priceCents: l.p.price_cents, categoryId: l.p.category_id, quantity: l.quantity })), fee, input.couponCode, true);
+        const subtotal = pricing.subtotalCents;
+        const total = Math.max(0, subtotal + fee - pricing.discountCents);
         if (!Number.isSafeInteger(total)) throw new UnprocessableError('TOTAL_OVERFLOW', 'Order total too large');
         const itemCount = lines.reduce((s, l) => s + l.quantity, 0);
         const currency = products.rows[0]!.currency;
 
         const o = await c.query<OrderRow>(
-          `INSERT INTO orders (id, user_id, status, total_cents, currency, item_count, payment_method, delivery_name, delivery_phone, delivery_area, delivery_address, subtotal_cents, delivery_fee_cents, zone_id)
-           VALUES ($1,$2,'PENDING_PAYMENT',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING ${ORDER_COLS}`,
-          [orderId, userId, total, currency, itemCount, input.paymentMethod ?? null, input.delivery?.name ?? null, input.delivery?.phone ?? null, input.delivery?.area ?? null, input.delivery?.address ?? null, subtotal, fee, zoneId],
+          `INSERT INTO orders (id, user_id, status, total_cents, currency, item_count, payment_method, delivery_name, delivery_phone, delivery_area, delivery_address, subtotal_cents, delivery_fee_cents, zone_id, discount_cents, coupon_id, bundle_id, bundle_discount_cents)
+           VALUES ($1,$2,'PENDING_PAYMENT',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING ${ORDER_COLS}`,
+          [orderId, userId, total, currency, itemCount, input.paymentMethod ?? null, input.delivery?.name ?? null, input.delivery?.phone ?? null, input.delivery?.area ?? null, input.delivery?.address ?? null, subtotal, fee, zoneId, pricing.discountCents, pricing.coupon?.id ?? null, pricing.bundle?.id ?? null, pricing.bundle?.discountCents ?? 0],
         );
+        await recordRedemption(c, orderId, userId, pricing);
         await this.touchCustomer(c, userId, input.delivery);
         const items = await c.query<ItemRow>(
-          `INSERT INTO order_items (order_id, line_no, product_id, sku, name, quantity, unit_price_cents)
-           SELECT $1, * FROM unnest($2::smallint[], $3::uuid[], $4::text[], $5::text[], $6::int[], $7::bigint[])
+          `INSERT INTO order_items (order_id, line_no, product_id, sku, name, quantity, unit_price_cents, flash_sale_id)
+           SELECT $1, * FROM unnest($2::smallint[], $3::uuid[], $4::text[], $5::text[], $6::int[], $7::bigint[], $8::uuid[])
            RETURNING line_no, product_id, sku, name, quantity, unit_price_cents`,
           [
             orderId,
@@ -302,7 +310,8 @@ export class OrderService {
             lines.map((l) => l.p.sku),
             lines.map((l) => l.p.name),
             lines.map((l) => l.quantity),
-            lines.map((l) => l.p.price_cents),
+            pricing.lines.map((l) => l.unitCents),
+            pricing.lines.map((l) => l.flashSaleId),
           ],
         );
         const order = toOrder(o.rows[0]!, items.rows.sort((a, b) => a.line_no - b.line_no));
@@ -598,6 +607,7 @@ export class OrderService {
       [order.id, to, order.version, cancelReason ?? null],
     );
     if (!rowCount) throw new ConflictError('VERSION_CONFLICT', 'Order was modified concurrently');
+    if (to === 'CANCELLED') await releaseRedemption(c, order.id);
     return (await this.repo.load(c, order.id))!;
   }
 }

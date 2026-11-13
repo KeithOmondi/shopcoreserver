@@ -268,3 +268,42 @@ describe('audit trail', () => {
     expect(Number(p2.items[0]!.id)).toBeLessThan(Number(p1.items[2]!.id));
   });
 });
+
+describe('the web admin’s refresh cookie', () => {
+  const web = { 'x-client': 'web' };
+  const cookieOf = (r: { headers: Record<string, unknown> }) => String(r.headers['set-cookie'] ?? '');
+
+  it('keeps the refresh token in an httpOnly cookie, out of the response body', async () => {
+    const r = await h.app.inject({ method: 'POST', url: '/v1/auth/login', headers: web, payload: { email: 'grace@t.co', password: PW } });
+    expect(r.statusCode).toBe(200);
+    expect(r.json().refreshToken).toBeUndefined();
+    expect(r.json().accessToken).toBeTruthy();
+    const set = cookieOf(r);
+    expect(set).toMatch(/^sc_refresh=[A-Za-z0-9_-]{20,};/);
+    expect(set).toContain('HttpOnly');
+    expect(set).toContain('SameSite=Strict');
+    expect(set).toContain('Path=/v1/auth');
+
+    const token = /^sc_refresh=([^;]+)/.exec(set)![1]!;
+    // The cookie alone refreshes, and rotates itself.
+    const next = await h.app.inject({ method: 'POST', url: '/v1/auth/refresh', headers: { ...web, cookie: `sc_refresh=${token}` }, payload: {} });
+    expect(next.statusCode).toBe(200);
+    expect(next.json().refreshToken).toBeUndefined();
+    const rotated = /^sc_refresh=([^;]+)/.exec(cookieOf(next))![1]!;
+    expect(rotated).not.toBe(token);
+    // Reusing the old one is theft: refused.
+    expect((await h.app.inject({ method: 'POST', url: '/v1/auth/refresh', headers: { ...web, cookie: `sc_refresh=${token}` }, payload: {} })).statusCode).toBe(401);
+  });
+
+  it('ignores the cookie for anyone who doesn’t say they are the web admin, and clears it on sign-out', async () => {
+    const r = await h.app.inject({ method: 'POST', url: '/v1/auth/login', headers: web, payload: { email: 'samuel@t.co', password: PW } });
+    const token = /^sc_refresh=([^;]+)/.exec(cookieOf(r))![1]!;
+    expect((await h.app.inject({ method: 'POST', url: '/v1/auth/refresh', headers: { cookie: `sc_refresh=${token}` }, payload: {} })).statusCode).toBe(401);
+    const app = await h.app.inject({ method: 'POST', url: '/v1/auth/login', payload: { email: 'samuel@t.co', password: PW } });
+    expect(app.json().refreshToken).toBeTruthy();
+    expect(cookieOf(app)).toBe('');
+    const out = await h.app.inject({ method: 'POST', url: '/v1/auth/logout', headers: { ...web, authorization: `Bearer ${r.json().accessToken}` } });
+    expect(out.statusCode).toBe(204);
+    expect(cookieOf(out)).toContain('Max-Age=0');
+  });
+});

@@ -164,3 +164,89 @@ Resolving a dispute for the customer can open a refund for what is still owed.
 **Shoppers:** `POST/GET /v1/support/tickets` (+ `/:id`, `/:id/messages`, `/:id/rating`), `GET /v1/support/chat`, `POST /v1/support/chat/messages`,
 `POST /v1/orders/:id/returns | refund-requests | review` (delivered orders; returns within 14 days), `GET /v1/support/claims`, and the public `GET /v1/help/articles?q=` / `/:id`
 (searches that find nothing are remembered). **Riders:** `POST/GET /v1/rider/support/tickets` (+ `/:id`, `/:id/messages`).
+
+## Finance and payroll
+
+Money is integer cents (KES). Staff routes (`/v1/admin/...`); *Payments module* unless noted. IT and support have no access to either module.
+All list and report calls are `no-store`. Business time is Nairobi (UTC+3); a "month" is `YYYY-MM`.
+
+**Overview and reports:** `finance/overview` (month totals, 30-day chart, what needs attention), `finance/settings` (GET/PATCH: cost-of-goods %, store commission %, processing fee %, COD hand-in hours, expense limit, VAT rate),
+`accounts` (money held / owed, worked out from the source records, with recent journal entries), `reports/profit-and-loss?month`, `reports/sales?from&to`, `reports/delivery-cost?month`,
+`vat` (+ `POST vat/:month/prepare`, `POST vat/:month/file {ack}`).
+
+**Payments:** `payments` (`?status&method&q&failuresOnly`; successful payments come from paid orders, failed attempts from `failed_payments`), `payments/:id` (+ timeline), `payments/:id/retry`, `payments/retry-eligible`.
+The payment service reports a failed attempt with `POST /v1/orders/:id/payment-failure {method, reason, ref}` (service token, `payments` role; the same `ref` twice changes nothing).
+A retry that clears pays the order; after three attempts a payment goes to *manual review*. The gateway is pluggable (`PaymentGateway`); a development stand-in is used until the M-Pesa/card connection.
+**Reconciliation:** `POST reconciliation {file, text}` (CSV with a reference and an amount column) matches lines to paid orders; `GET reconciliation[/:id]`; `POST reconciliation/:id/lines/:lineId/resolve {how, note, orderId?}`; `POST reconciliation/:id/complete`.
+
+**Cash and payouts:** `cash` and `cash/:riderId/deposit {amountCents, ref, method?, account?, note?}` (receipt numbers are unique; each rider shows `overdue` past the hand-in window).
+`payout-batches` (GET, POST `{payoutIds, note}`, GET/PATCH/DELETE `/:id`, `POST /:id/send`): **maker-checker**: the preparer can't send their own batch (owners may). Sending is repeatable; each payout records `paid` or `failed`
+(a failed one returns the money to the rider). `settlements` (what is owed to each collection point after commission; `POST settlements/:id/pay {ref}`).
+
+**Expenses and invoices:** `expenses` (POST; an owner's own entry is approved at once), `expenses/:id/decision {to, note}`: nobody approves their own, and above the expense limit only an owner approves.
+`invoices` (POST `{customer, lines[], dueInDays, draft}`; status is worked out: Draft / Sent / Partly paid / Paid / Overdue), `/:id/send`, `/:id/payments {amountCents, method, ref}`, `/:id/remind`, `DELETE /:id` (drafts only).
+
+**Closing a month:** `periods`, `periods/:month` (checklist: reconcile, COD, payouts, expenses, VAT filed, payroll paid), `POST periods/:month/close {note}` (only when every control is done and the month is over),
+`DELETE periods/:month` (owner only, reopens). A closed month rejects expenses, deposits, invoices, batches, settlements and payroll dated in it.
+**Exports:** `POST exports {dataset, format: "CSV", month?}` returns the CSV and logs who took it (`GET exports`). Excel files arrive with the wire-up phase. Payroll data needs the *Payroll* module.
+
+**Payroll (*Payroll module*):** `payroll/profiles` (+ `PATCH /:staffId`; amounts never go to the audit log), `payroll/statutory` (GET/PUT; the rates in force are copied into each run),
+`payroll/runs` (POST `{month}` works out every active person's slip), `runs/:id`, `runs/:id/adjust/:staffId {bonusCents, otherDeductionCents, note}` (drafts only),
+`runs/:id/action {submit|return|approve|pay}`, `runs/:id/payslips/:staffId`, `runs/:id/remittances {kind, ref}`.
+Only an owner approves payroll, and never the person who prepared the run (no owner exception here). The statutory figures (NSSF, SHIF, housing levy, PAYE bands, relief) are defaults to **confirm with your accountant**.
+
+## Marketing
+
+Staff routes (`/v1/admin/...`, *Marketing module*; the marketing manager and the owner have it, support and finance don't).
+
+**Audiences:** `segments` (+ `POST segments/preview {match, rules}` to see how many people rules reach before saving; fields `area | spend | orders | lastOrder`). The built-in *All customers* can't change.
+Counts are split by what people agreed to: customers choose push/email/SMS with `PUT /v1/me/marketing {push, email, sms}` and everything defaults to **no**. A segment a campaign or coupon uses can't be deleted.
+
+**Coupons** (`coupons`, `coupons/state {ids, state}`): percentage (1-100, optional cap), fixed amount, or free delivery; minimum spend, total and per-customer limits, dates, categories, audience (all / new customers / a segment).
+Shoppers send `couponCode` when creating an order (and can preview with `POST /v1/coupons/quote {items, area, couponCode}`). **The discount is always worked out on the server** from live prices; a refused code comes back as
+`422 COUPON_INVALID` with a sentence a shopper can read. The coupon row is locked while an order takes it, so a limit can't be beaten by two orders at once, and a cancelled order gives its use back.
+A used coupon's code and type are frozen. `orders.discount_cents` is the total taken off (order total = goods + delivery − discount).
+
+**Flash sales and bundles:** a live sale changes the price shoppers pay (the order line records the sale price); products at or below the sale's stock guard are left out, and a product can sit in only one live sale at once.
+Bundles (fixed price for a set), cross-sells and multi-buys (% off when you take N) give the best single saving for a basket. By default coupons don't stack on sale items (`marketing/rules.noStackFlash`) and a coupon with `combine: false` is refused when a bundle applies.
+
+**Homepage:** `banners` (+ `/:id/move`, `banner-settings`): publishing needs alt text and a link that goes somewhere (fixed storefront routes, a category, or a published page).
+`homepage` sections are a draft; `POST homepage/publish {mode: now|later, at}` copies them to what shoppers see (`GET /v1/storefront/home?platform=web|mobile`, no login). A scheduled layout goes live from the worker.
+
+**Push, email, SMS:** `pushes`, `messages` (`action`: `draft | schedule | now`). Sends are held out of quiet hours (21:00 to 07:00 Nairobi) when the campaign says so, one capped push a day per overlapping audience (`409 FREQUENCY_CAP`),
+and due ones are sent by the worker (`marketing-due`, every 30 s). Reach counts only opted-in customers. Opens, deliveries and clicks come back from the provider at `POST /v1/internal/marketing/:kind/:id/results` (service token with the `notifications` role).
+Until the real providers are connected a development sender only records the send.
+
+**Campaigns** (`campaigns`, `campaigns/:id/channels`): a coupon-linked campaign's conversions and sales come from real redemptions; other channels are entered or reported by the provider. **Loyalty and referral** settings, **review highlights**
+(good, visible reviews chosen for the storefront), **pages** (`pages`, published pages appear at `GET /v1/storefront/page?slug=`), and **category copy** (`category-content`, `GET /v1/storefront/categories/:handle`).
+
+## Web admin sign-in, M-Pesa, text messages, files
+
+**Web admin refresh cookie.** Send `X-Client: web` on `/v1/auth/login`, `/refresh` and `/logout`: the refresh token then travels only in an httpOnly, `SameSite=Strict` cookie
+(`sc_refresh`, path `/v1/auth`, `Secure` in production) and is left out of the response body; `/refresh` reads the cookie. Without the header nothing changes, so the phone apps keep using the body token.
+Serve the admin and the API from one address (the dev server proxies `/v1`); if they must differ, set `CORS_ORIGINS` and `VITE_API_URL`.
+
+**M-Pesa** (`MPESA_ENV`: `off | simulator | sandbox | production`). Customer: `POST /v1/orders/:id/pay/mpesa {phone}` sends the STK prompt (order total must be whole shillings),
+`GET` the same path to poll `{status: pending|success|failed|cancelled, message, receipt}`. Safaricom posts the result to `POST /v1/webhooks/mpesa/:secret` (the secret is `MPESA_CALLBACK_SECRET`, compared in constant time).
+A good result marks the order paid with the M-Pesa receipt as its payment reference, once; an amount that doesn't match leaves the order unpaid and writes an `mpesa.mismatch` audit entry;
+a failed or cancelled prompt lands in the failed-payments list. In `simulator` mode no network call is made: `POST` the callback yourself (see `test/integration/integrations.test.ts`).
+With real M-Pesa on, "retry" in the failed-payments list asks the customer to pay again from the app (it never charges anyone itself).
+
+**Text messages** (`SMS_PROVIDER=africastalking`, `AT_USERNAME`, `AT_API_KEY`, optional `AT_SENDER_ID`): rider sign-in codes and other texts go out through Africa's Talking; `console` only logs.
+
+**Files.** `PUT /v1/uploads?kind=<rider-document|banner|return-photo|delivery-photo|avatar|product-image>&name=` with the picture (JPEG, PNG or WebP; PDF for rider documents) as the request body and its `Content-Type`.
+The bytes are checked, not just the label; the limit is `UPLOAD_MAX_BYTES`. Returns `{id, url}`; `GET /v1/files/:id` serves it: banners and product pictures to anyone, everything else to the uploader and to staff.
+Who may upload what is fixed per kind (customers: returns, avatar; riders: documents, delivery photos; staff: banners and product pictures with the matching permission).
+In production, payouts to riders refuse to send until a real sender is connected (`PAYOUTS_NOT_CONNECTED`): pay from the M-Pesa portal and mark each payout paid.
+
+## Shopper accounts (customer app)
+
+Sign-up is two steps so a number is confirmed before an account exists: `POST /v1/customer/auth/signup {fullName, email, phone, password}` (202, code sent by SMS; `409 EMAIL_EXISTS` / `PHONE_EXISTS` carry `details.field`),
+then `POST /v1/customer/auth/verify-signup {phone, code}` (201, returns tokens and the user). `POST .../resend {phone}`. Sign in with `POST .../login {identifier, password}` (email or phone; five wrong passwords lock it for ten minutes),
+`POST .../refresh {refreshToken}` (rotating; a reused token ends the whole session family), `POST .../logout`.
+Forgotten password: `POST .../forgot {identifier}` (always 202, so it can't reveal who has an account) → `POST .../verify-reset {identifier, code}` → `{resetToken}` → `POST .../reset {resetToken, password}` (ends every session).
+Account: `GET/PATCH /v1/customer/me`, `POST /v1/customer/me/password`, `POST /v1/customer/me/delete {password}` (refused while paid orders are on their way; wipes name, contact and consent, keeps orders). Access tokens last 15 minutes (`CUSTOMER_ACCESS_TTL_S`) and
+are checked against the live session on these routes, so signing out or deleting takes effect at once. In development set `CUSTOMER_DEV_OTP` to fix the code (the app's demo code is 123456).
+
+**Shop catalogue (public).** `GET /v1/storefront/catalogue` returns the categories (with sub-categories), brands and every buyable product in one call: picture links (`/v1/files/:id`), the price right now
+(a live flash sale included, with `listPriceCents` beside it), `inStock`, `isNew`, and a rating that is the average of shoppers' reviews of orders containing the product. Attach pictures with `PUT /v1/admin/products/:id/images {uploadIds}` (uploaded as kind `product-image`).

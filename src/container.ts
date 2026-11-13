@@ -15,12 +15,25 @@ import { PurchasingService } from './modules/inventory/purchasing.js';
 import { WarehouseService } from './modules/inventory/warehouse.js';
 import { AdminOrdersService, CustomersService } from './modules/orders/admin-orders.js';
 import { ZonesService } from './modules/dispatch/zones.js';
-import { RidersService, consoleSms } from './modules/dispatch/riders.js';
+import { RidersService } from './modules/dispatch/riders.js';
+import { makeSms } from './modules/integrations/sms.js';
+import { CustomerAuthService } from './modules/customers/auth.js';
+import { MpesaService, makeMpesaClient } from './modules/integrations/mpesa.js';
+import { UploadService } from './modules/integrations/storage.js';
 import { DispatchService } from './modules/dispatch/dispatch.js';
 import { RiderMoneyService } from './modules/dispatch/money.js';
 import { SupportService } from './modules/support/support.js';
 import { ClaimsService } from './modules/support/claims.js';
 import type { AppDeps } from './http/app.js';
+import { PaymentsService, askCustomerGateway, devGateway } from './modules/finance/payments.js';
+import { CashService, devPayoutGateway, unconnectedPayouts } from './modules/finance/cash.js';
+import { BillingService } from './modules/finance/billing.js';
+import { PayrollService } from './modules/finance/payroll.js';
+import { ReportsService } from './modules/finance/reports.js';
+import { AudienceService } from './modules/marketing/audience.js';
+import { PromotionsService } from './modules/marketing/promotions.js';
+import { EngageService } from './modules/marketing/engage.js';
+import { ContentService, StorefrontService } from './modules/marketing/content.js';
 
 /**
  * Composition root: the only place that wires concrete infrastructure into services.
@@ -65,11 +78,25 @@ export async function createContainer(cfg: Config, log: Logger): Promise<Contain
   const adminOrders = new AdminOrdersService(db);
   const customers = new CustomersService(db);
   const zones = new ZonesService(db);
-  const riders = new RidersService(db, cfg, consoleSms(log));
+  const sms = makeSms(cfg, log);
+  const riders = new RidersService(db, cfg, sms);
+  const customerAuth = new CustomerAuthService(db, cfg, sms);
   const dispatch = new DispatchService(db);
   const riderMoney = new RiderMoneyService(db);
   const support = new SupportService(db);
   const claims = new ClaimsService(db);
+  const paymentsAdmin = new PaymentsService(db, orders, cfg.MPESA_ENV === 'sandbox' || cfg.MPESA_ENV === 'production' ? askCustomerGateway : devGateway);
+  const cash = new CashService(db, cfg.NODE_ENV === 'production' ? unconnectedPayouts : devPayoutGateway);
+  const mpesa = new MpesaService(db, cfg, makeMpesaClient(cfg), orders, paymentsAdmin, log);
+  const uploads = new UploadService(db, cfg);
+  const billing = new BillingService(db);
+  const payroll = new PayrollService(db);
+  const reports = new ReportsService(db, cash);
+  const audience = new AudienceService(db);
+  const promotions = new PromotionsService(db);
+  const engage = new EngageService(db);
+  const content = new ContentService(db);
+  const storefront = new StorefrontService(db, engage, promotions);
 
   // Verify connectivity once at boot, so a misconfigured pod never becomes Ready.
   await db.ping();
@@ -98,6 +125,19 @@ export async function createContainer(cfg: Config, log: Logger): Promise<Contain
     riderMoney,
     support,
     claims,
+    paymentsAdmin,
+    cash,
+    billing,
+    payroll,
+    reports,
+    mpesa,
+    uploads,
+    customerAuth,
+    audience,
+    promotions,
+    engage,
+    content,
+    storefront,
     health: {
       // Readiness reflects *this pod's* ability to serve; it deliberately does not
       // ping shared dependencies on every probe, otherwise one database blip would mark

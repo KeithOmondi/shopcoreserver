@@ -7,3 +7,4 @@ loadtest/results/*.raw.json
 *.log
 .env
 .env.example
+uploads

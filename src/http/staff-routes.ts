@@ -45,7 +45,25 @@ export type Authz = ReturnType<typeof makeAuthz>;
 
 const NameParam = z.object({ name: z.string().min(1).max(60) });
 
-export function registerStaffRoutes(app: FastifyInstance, staff: StaffService, authz: Authz) {
+/**
+ * The web admin keeps its refresh token in an httpOnly cookie, out of reach of page scripts. A browser tells us it is the web admin
+ * with `X-Client: web` (a header other sites can't send without our permission), so the cookie is never set for, or read from, anyone else.
+ * The phone apps send and receive the token in the body as before.
+ */
+const COOKIE = 'sc_refresh';
+export interface CookieOptions { secure: boolean; maxAgeS: number }
+
+export function registerStaffRoutes(app: FastifyInstance, staff: StaffService, authz: Authz, cookie: CookieOptions = { secure: false, maxAgeS: 12 * 3600 }) {
+  const isWeb = (req: FastifyRequest) => req.headers['x-client'] === 'web';
+  const fromCookie = (req: FastifyRequest) => /(?:^|;s*)sc_refresh=([A-Za-z0-9_-]+)/.exec(String(req.headers.cookie ?? ''))?.[1];
+  const attr = `HttpOnly; SameSite=Strict; Path=/v1/auth${cookie.secure ? '; Secure' : ''}`;
+  /** For the web admin: move the refresh token out of the body into the cookie. */
+  const hideToken = <T extends { refreshToken: string }>(req: FastifyRequest, reply: { header: (k: string, v: string) => unknown }, out: T): Omit<T, 'refreshToken'> & { refreshToken?: string } => {
+    if (!isWeb(req)) return out;
+    reply.header('set-cookie', `${COOKIE}=${out.refreshToken}; Max-Age=${cookie.maxAgeS}; ${attr}`);
+    const { refreshToken: _t, ...rest } = out;
+    return rest;
+  };
   const client = (req: FastifyRequest) => ({ ip: req.ip, userAgent: String(req.headers['user-agent'] ?? ''), requestId: String(req.id) });
   const noStore = (reply: { header: (k: string, v: string) => unknown }) => reply.header('cache-control', 'no-store');
 
@@ -53,14 +71,18 @@ export function registerStaffRoutes(app: FastifyInstance, staff: StaffService, a
   app.post('/v1/auth/login', async (req, reply) => {
     noStore(reply);
     const { email, password } = parse(LoginSchema, req.body);
-    return staff.login(email, password, client(req));
+    return hideToken(req, reply, await staff.login(email, password, client(req)));
   });
   app.post('/v1/auth/refresh', async (req, reply) => {
     noStore(reply);
-    return staff.refresh(parse(RefreshSchema, req.body).refreshToken, client(req));
+    const body = parse(RefreshSchema, req.body ?? {});
+    const token = body.refreshToken ?? (isWeb(req) ? fromCookie(req) : undefined);
+    if (!token) throw new AppError('SIGN_IN_REQUIRED', 'Please sign in again', 401);
+    return hideToken(req, reply, await staff.refresh(token, client(req)));
   });
   app.post('/v1/auth/logout', async (req, reply) => {
     await staff.logout(await authz.staffContext(req, { allowPending: true }));
+    if (isWeb(req)) reply.header('set-cookie', `${COOKIE}=; Max-Age=0; ${attr}`);
     return reply.status(204).send();
   });
   app.post('/v1/auth/change-password', async (req, reply) => {

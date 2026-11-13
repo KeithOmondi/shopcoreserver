@@ -268,6 +268,15 @@ describe('a delivery from offer to payout', () => {
     expect((await call('POST', `/v1/admin/cash/${rider.id}/deposit`, samuel, { amountCents: 600_000, ref: 'MPESA-ABC1' })).json().error.code).toBe('MORE_THAN_HELD');
     const dep = await call('POST', `/v1/admin/cash/${rider.id}/deposit`, samuel, { amountCents: 510_000, ref: 'MPESA-ABC1' });
     expect(dep.json()).toMatchObject({ totalHeldCents: 0, deposits: [expect.objectContaining({ amountCents: 510_000, receivedBy: 'Samuel' })] });
+    expect(dep.json().deposits[0]).toMatchObject({ method: 'Cash at hub', account: '', note: '' });
+    // The same receipt number can’t be recorded twice, and a closed month takes no deposits.
+    expect((await call('POST', `/v1/admin/cash/${rider.id}/deposit`, samuel, { amountCents: 1, ref: 'mpesa-abc1' })).json().error.code).toMatch(/MORE_THAN_HELD|REF_USED/);
+    const settle = (await call('GET', '/v1/admin/settlements', samuel)).json();
+    expect(settle.items[0]).toMatchObject({ store: 'Main warehouse', commissionRate: 12, paid: null });
+    expect(settle.items[0].netCents).toBe(settle.items[0].salesCents - settle.items[0].commissionCents);
+    const paidS = await call('POST', `/v1/admin/settlements/${settle.items[0].id}/pay`, samuel, { ref: 'EFT-9001' });
+    expect(paidS.json()).toMatchObject({ paid: { ref: 'EFT-9001', by: 'Samuel' } });
+    expect((await call('POST', `/v1/admin/settlements/${settle.items[0].id}/pay`, samuel, { ref: 'EFT-9002' })).json().error.code).toBe('ALREADY_PAID');
   });
 
   it('pays out earnings: minimum, fee, and the money set aside while pending', async () => {

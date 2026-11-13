@@ -1,16 +1,21 @@
 import { z } from 'zod';
-import type { Database } from '../../infra/db.js';
+import type { Database, Queryable } from '../../infra/db.js';
 import { ConflictError, NotFoundError, UnprocessableError } from '../../domain/errors.js';
 import { isUuid, uuidv7 } from '../../infra/uuid.js';
 import { audit, type Actor } from '../products/products.js';
 import type { RiderContext } from './riders.js';
+import { assertOpen, financeSettings } from '../finance/common.js';
 
 const uuid = z.string().refine(isUuid, 'must be a UUID');
 export const WithdrawSchema = z.strictObject({ amountCents: z.number().int().min(1).max(100_000_000) });
 export const PayoutListSchema = z.object({ status: z.enum(['pending', 'paid', 'failed']).optional(), riderId: uuid.optional(), limit: z.coerce.number().int().min(1).max(200).default(100) });
 export const PayoutPaySchema = z.strictObject({ providerRef: z.string().trim().min(3).max(60) });
 export const PayoutFailSchema = z.strictObject({ reason: z.string().trim().min(3).max(200) });
-export const DepositSchema = z.strictObject({ amountCents: z.number().int().min(1).max(100_000_000), ref: z.string().trim().min(3).max(60) });
+export const DEPOSIT_METHODS = ['Bank deposit', 'M-Pesa transfer', 'Cash at hub'] as const;
+export const DepositSchema = z.strictObject({
+  amountCents: z.number().int().min(1).max(100_000_000), ref: z.string().trim().min(3).max(60),
+  method: z.enum(DEPOSIT_METHODS).default('Cash at hub'), account: z.string().trim().max(120).default(''), note: z.string().trim().max(300).default(''),
+});
 export const AdjustSchema = z.strictObject({ amountCents: z.number().int().refine((n) => n !== 0, 'must be non-zero'), note: z.string().trim().min(3).max(200) });
 
 interface Settings { minWithdrawCents: number; withdrawFeeCents: number }
@@ -83,26 +88,13 @@ export class RiderMoneyService {
   }
 
   async markPaid(id: string, input: z.infer<typeof PayoutPaySchema>, actor: Actor) {
-    await this.db.tx(async (c) => {
-      const p = (await c.query<{ status: string }>('SELECT status FROM payouts WHERE id = $1 FOR UPDATE', [id])).rows[0];
-      if (!p) throw new NotFoundError('Payout');
-      if (p.status !== 'pending') throw new ConflictError('ALREADY_SETTLED', `This payout is already ${p.status}`);
-      await c.query(`UPDATE payouts SET status = 'paid', paid_at = now(), paid_by = $2, provider_ref = $3 WHERE id = $1`, [id, actor.name ?? 'Staff', input.providerRef]);
-      await audit(c, actor, 'payout.paid', 'payout', id, input);
-    });
+    await this.db.tx((c) => settlePayoutPaid(c, id, input.providerRef, actor));
     return (await this.payouts({ limit: 200 })).items.find((p) => p.id === id)!;
   }
 
   /** A payout that didn’t go through: the money goes back to the rider’s balance. */
   async markFailed(id: string, input: z.infer<typeof PayoutFailSchema>, actor: Actor) {
-    await this.db.tx(async (c) => {
-      const p = (await c.query<{ status: string; rider_id: string; amount_cents: number; fee_cents: number }>('SELECT status, rider_id, amount_cents, fee_cents FROM payouts WHERE id = $1 FOR UPDATE', [id])).rows[0];
-      if (!p) throw new NotFoundError('Payout');
-      if (p.status !== 'pending') throw new ConflictError('ALREADY_SETTLED', `This payout is already ${p.status}`);
-      await c.query(`UPDATE payouts SET status = 'failed', failure_reason = $2 WHERE id = $1`, [id, input.reason]);
-      await c.query(`INSERT INTO rider_ledger (rider_id, kind, amount_cents, payout_id, note, by_name) VALUES ($1,'payout_reversal',$2,$3,$4,$5)`, [p.rider_id, p.amount_cents + p.fee_cents, id, `Payout failed: ${input.reason}`, actor.name ?? 'Staff']);
-      await audit(c, actor, 'payout.failed', 'payout', id, input);
-    });
+    await this.db.tx((c) => settlePayoutFailed(c, id, input.reason, actor));
     return (await this.payouts({ limit: 200 })).items.find((p) => p.id === id)!;
   }
 
@@ -127,17 +119,15 @@ export class RiderMoneyService {
 
   async cash() {
     return this.db.read(async (c) => {
-      const { rows } = await c.query<{ rider_id: string; rider: string; phone: string; held: number; oldest: Date | null; orders: number }>(
-        `SELECT r.id AS rider_id, r.name AS rider, r.phone, COALESCE(sum(rc.amount_cents),0)::bigint AS held,
-                (SELECT min(created_at) FROM rider_cash x WHERE x.rider_id = r.id AND x.kind = 'collected' AND x.created_at > COALESCE((SELECT max(created_at) FROM rider_cash d WHERE d.rider_id = r.id AND d.kind = 'deposit'), 'epoch')) AS oldest,
-                count(rc.id) FILTER (WHERE rc.kind = 'collected')::int AS orders
-           FROM riders r JOIN rider_cash rc ON rc.rider_id = r.id GROUP BY r.id HAVING COALESCE(sum(rc.amount_cents),0) > 0 ORDER BY held DESC`);
-      const recent = (await c.query<{ id: number; rider: string; amount_cents: number; ref: string; by_name: string; created_at: Date }>(
-        `SELECT rc.id, r.name AS rider, rc.amount_cents, rc.ref, rc.by_name, rc.created_at FROM rider_cash rc JOIN riders r ON r.id = rc.rider_id WHERE rc.kind = 'deposit' ORDER BY rc.id DESC LIMIT 50`)).rows;
+      const windowHours = (await financeSettings(c)).codWindowHours;
+      const owed = await codOwed(c, windowHours);
+      const recent = (await c.query<{ id: number; rider: string; rider_id: string; amount_cents: number; ref: string; by_name: string; created_at: Date; method: string | null; account: string | null; note: string }>(
+        `SELECT rc.id, r.name AS rider, r.id AS rider_id, rc.amount_cents, rc.ref, rc.by_name, rc.created_at, rc.method, rc.account, rc.note FROM rider_cash rc JOIN riders r ON r.id = rc.rider_id WHERE rc.kind = 'deposit' ORDER BY rc.id DESC LIMIT 50`)).rows;
       return {
-        owed: rows.map((r) => ({ riderId: r.rider_id, rider: r.rider, phone: r.phone, heldCents: Number(r.held), since: r.oldest?.toISOString() ?? null })),
-        totalHeldCents: rows.reduce((n, r) => n + Number(r.held), 0),
-        deposits: recent.map((d) => ({ id: String(d.id), rider: d.rider, amountCents: -d.amount_cents, ref: d.ref, receivedBy: d.by_name, at: d.created_at.toISOString() })),
+        owed,
+        windowHours,
+        totalHeldCents: owed.reduce((n, r) => n + r.heldCents, 0),
+        deposits: recent.map((d) => ({ id: String(d.id), riderId: d.rider_id, rider: d.rider, amountCents: -d.amount_cents, ref: d.ref, method: d.method, account: d.account, note: d.note, receivedBy: d.by_name, at: d.created_at.toISOString() })),
       };
     });
   }
@@ -148,9 +138,38 @@ export class RiderMoneyService {
       if (!(await c.query('SELECT 1 FROM riders WHERE id = $1 FOR UPDATE', [riderId])).rowCount) throw new NotFoundError('Rider');
       const held = Number((await c.query<{ h: number }>('SELECT COALESCE(sum(amount_cents),0)::bigint AS h FROM rider_cash WHERE rider_id = $1', [riderId])).rows[0]!.h);
       if (input.amountCents > held) throw new UnprocessableError('MORE_THAN_HELD', 'That’s more than this rider is holding', { heldCents: held });
-      await c.query(`INSERT INTO rider_cash (rider_id, kind, amount_cents, ref, by_name) VALUES ($1,'deposit',$2,$3,$4)`, [riderId, -input.amountCents, input.ref, actor.name ?? 'Staff']);
+      await assertOpen(c);
+      if ((await c.query(`SELECT 1 FROM rider_cash WHERE kind = 'deposit' AND lower(ref) = lower($1)`, [input.ref])).rowCount) throw new ConflictError('REF_USED', 'That reference has already been recorded');
+      await c.query(`INSERT INTO rider_cash (rider_id, kind, amount_cents, ref, by_name, method, account, note) VALUES ($1,'deposit',$2,$3,$4,$5,$6,$7)`, [riderId, -input.amountCents, input.ref, actor.name ?? 'Staff', input.method, input.account, input.note]);
       await audit(c, actor, 'cash.deposit', 'rider', riderId, input);
     });
     return this.cash();
   }
+}
+
+/** Settling a payout, shared by single payouts and payout batches. Runs inside the caller’s transaction. */
+export async function settlePayoutPaid(c: Queryable, id: string, providerRef: string, actor: Actor) {
+  const p = (await c.query<{ status: string }>('SELECT status FROM payouts WHERE id = $1 FOR UPDATE', [id])).rows[0];
+  if (!p) throw new NotFoundError('Payout');
+  if (p.status !== 'pending') throw new ConflictError('ALREADY_SETTLED', `This payout is already ${p.status}`);
+  await c.query(`UPDATE payouts SET status = 'paid', paid_at = now(), paid_by = $2, provider_ref = $3 WHERE id = $1`, [id, actor.name ?? 'Staff', providerRef]);
+  await audit(c, actor, 'payout.paid', 'payout', id, { providerRef });
+}
+export async function settlePayoutFailed(c: Queryable, id: string, reason: string, actor: Actor) {
+  const p = (await c.query<{ status: string; rider_id: string; amount_cents: number; fee_cents: number }>('SELECT status, rider_id, amount_cents, fee_cents FROM payouts WHERE id = $1 FOR UPDATE', [id])).rows[0];
+  if (!p) throw new NotFoundError('Payout');
+  if (p.status !== 'pending') throw new ConflictError('ALREADY_SETTLED', `This payout is already ${p.status}`);
+  await c.query(`UPDATE payouts SET status = 'failed', failure_reason = $2 WHERE id = $1`, [id, reason]);
+  await c.query(`INSERT INTO rider_ledger (rider_id, kind, amount_cents, payout_id, note, by_name) VALUES ($1,'payout_reversal',$2,$3,$4,$5)`, [p.rider_id, p.amount_cents + p.fee_cents, id, `Payout failed: ${reason}`, actor.name ?? 'Staff']);
+  await audit(c, actor, 'payout.failed', 'payout', id, { reason });
+}
+
+/** Riders holding cash they have collected from customers and not yet handed in. */
+export async function codOwed(c: Queryable, windowHours: number) {
+  const { rows } = await c.query<{ rider_id: string; rider: string; phone: string; held: number; oldest: Date | null; orders: number }>(
+    `SELECT r.id AS rider_id, r.name AS rider, r.phone, COALESCE(sum(rc.amount_cents),0)::bigint AS held,
+            (SELECT min(created_at) FROM rider_cash x WHERE x.rider_id = r.id AND x.kind = 'collected' AND x.created_at > COALESCE((SELECT max(created_at) FROM rider_cash d WHERE d.rider_id = r.id AND d.kind = 'deposit'), 'epoch')) AS oldest,
+            count(rc.id) FILTER (WHERE rc.kind = 'collected')::int AS orders
+       FROM riders r JOIN rider_cash rc ON rc.rider_id = r.id GROUP BY r.id HAVING COALESCE(sum(rc.amount_cents),0) > 0 ORDER BY held DESC`);
+  return rows.map((r) => ({ riderId: r.rider_id, rider: r.rider, phone: r.phone, heldCents: Number(r.held), since: r.oldest?.toISOString() ?? null, orders: r.orders, overdue: !!r.oldest && Date.now() - r.oldest.getTime() > windowHours * 3_600_000 }));
 }

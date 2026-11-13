@@ -49,7 +49,7 @@ const toView = (r: StaffRow): StaffView => ({
 
 const email = z.string().trim().toLowerCase().pipe(z.email().max(254));
 export const LoginSchema = z.strictObject({ email, password: z.string().min(1).max(256) });
-export const RefreshSchema = z.strictObject({ refreshToken: z.string().min(20).max(200) });
+export const RefreshSchema = z.strictObject({ refreshToken: z.string().min(20).max(200).optional() });
 export const ChangePasswordSchema = z.strictObject({ currentPassword: z.string().min(1).max(256), newPassword: z.string().min(1).max(256) });
 export const CreateStaffSchema = z.strictObject({
   name: z.string().trim().min(1).max(120), email,

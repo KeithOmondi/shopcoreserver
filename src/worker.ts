@@ -5,6 +5,7 @@ import { registry } from './infra/metrics.js';
 import { Database } from './infra/db.js';
 import { OrderRepository, OrderService } from './modules/orders/orders.js';
 import { DispatchService } from './modules/dispatch/dispatch.js';
+import { EngageService } from './modules/marketing/engage.js';
 import { KafkaPublisher, LogPublisher, OutboxRelay } from './workers/outbox-relay.js';
 
 /**
@@ -26,6 +27,7 @@ async function main() {
   const relay = new OutboxRelay(db.writer, publisher, cfg, log);
   const orders = new OrderService(db, new OrderRepository());
   const dispatch = new DispatchService(db);
+  const engage = new EngageService(db);
 
   const timers: NodeJS.Timeout[] = [];
   const every = (ms: number, name: string, fn: () => Promise<unknown>) => {
@@ -54,6 +56,11 @@ async function main() {
   every(10_000, 'expire-offers', async () => {
     const n = await dispatch.expireOffers();
     if (n) log.info({ expired: n }, 'expired rider offers');
+  });
+  // Scheduled pushes, emails and texts that have come due, and a homepage layout waiting for its time.
+  every(30_000, 'marketing-due', async () => {
+    const r = await engage.runDue();
+    if (r.pushes || r.messages || r.layout) log.info(r, 'marketing sends');
   });
   every(60_000, 'purge-idempotency', async () => {
     // Batched delete keeps each transaction short and avoids long locks / WAL spikes.

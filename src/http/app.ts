@@ -16,6 +16,22 @@ import type { InventoryService } from '../modules/inventory/inventory.js';
 import { registerAdminRoutes } from './admin-routes.js';
 import { registerFieldRoutes } from './field-routes.js';
 import { registerSupportRoutes } from './support-routes.js';
+import { registerFinanceRoutes } from './finance-routes.js';
+import { registerMarketingRoutes } from './marketing-routes.js';
+import { registerIntegrationRoutes } from './integration-routes.js';
+import { registerCustomerRoutes } from './customer-routes.js';
+import type { CustomerAuthService } from '../modules/customers/auth.js';
+import type { MpesaService } from '../modules/integrations/mpesa.js';
+import type { UploadService } from '../modules/integrations/storage.js';
+import type { AudienceService } from '../modules/marketing/audience.js';
+import type { PromotionsService } from '../modules/marketing/promotions.js';
+import type { EngageService } from '../modules/marketing/engage.js';
+import type { ContentService, StorefrontService } from '../modules/marketing/content.js';
+import type { PaymentsService } from '../modules/finance/payments.js';
+import type { CashService } from '../modules/finance/cash.js';
+import type { BillingService } from '../modules/finance/billing.js';
+import type { PayrollService } from '../modules/finance/payroll.js';
+import type { ReportsService } from '../modules/finance/reports.js';
 import type { SupportService } from '../modules/support/support.js';
 import type { ClaimsService } from '../modules/support/claims.js';
 import type { ZonesService } from '../modules/dispatch/zones.js';
@@ -56,6 +72,19 @@ export interface AppDeps {
   dispatch: DispatchService;
   riderMoney: RiderMoneyService;
   support: SupportService;
+  paymentsAdmin: PaymentsService;
+  cash: CashService;
+  billing: BillingService;
+  payroll: PayrollService;
+  reports: ReportsService;
+  mpesa: MpesaService;
+  customerAuth: CustomerAuthService;
+  uploads: UploadService;
+  audience: AudienceService;
+  promotions: PromotionsService;
+  engage: EngageService;
+  content: ContentService;
+  storefront: StorefrontService;
   claims: ClaimsService;
   health: { ready: () => boolean; deps: () => Promise<Record<string, string>> };
 }
@@ -89,7 +118,8 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     await app.register(cors, {
       origin: origins,
       methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
-      allowedHeaders: ['Authorization', 'Content-Type', 'Idempotency-Key', 'If-Match', 'X-Request-Id'],
+      allowedHeaders: ['Authorization', 'Content-Type', 'Idempotency-Key', 'If-Match', 'X-Request-Id', 'X-Client'],
+      credentials: true,
       maxAge: 600,
     });
   }
@@ -220,9 +250,13 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
 
   const actorOf = (req: FastifyRequest) => ({ id: requirePrincipal(req).sub, requestId: String(req.id) });
   const authz = makeAuthz(deps.staff);
-  registerStaffRoutes(app, deps.staff, authz);
+  registerStaffRoutes(app, deps.staff, authz, { secure: cfg.NODE_ENV === 'production', maxAgeS: cfg.STAFF_SESSION_TTL_S });
   registerFieldRoutes(app, { zones: deps.zones, riders: deps.riders, dispatch: deps.dispatch, riderMoney: deps.riderMoney, customers: deps.customers }, authz);
   registerSupportRoutes(app, { support: deps.support, claims: deps.claims, riders: deps.riders }, authz);
+  registerCustomerRoutes(app, deps.customerAuth);
+  registerIntegrationRoutes(app, { mpesa: deps.mpesa, uploads: deps.uploads }, authz, cfg);
+  registerMarketingRoutes(app, { audience: deps.audience, promotions: deps.promotions, engage: deps.engage, content: deps.content, storefront: deps.storefront }, authz);
+  registerFinanceRoutes(app, { payments: deps.paymentsAdmin, cash: deps.cash, billing: deps.billing, payroll: deps.payroll, reports: deps.reports }, authz);
   registerAdminRoutes(app, { catalog: deps.catalog, inventory: deps.inventory, purchasing: deps.purchasing, warehouse: deps.warehouse, adminOrders: deps.adminOrders, customers: deps.customers }, authz);
 
   // ---- catalog (public reads) ---------------------------------------------

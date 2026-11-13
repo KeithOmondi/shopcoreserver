@@ -64,6 +64,10 @@ const schema = z.object({
   RIDER_ACCESS_TTL_S: z.coerce.number().int().min(60).max(86400).default(3600),
   RIDER_SESSION_TTL_S: z.coerce.number().int().min(3600).default(30 * 86400),
   RIDER_DEV_OTP: z.string().regex(/^\d{6}$/).optional(),
+  // Shopper sign-in: short-lived access tokens, long-lived refresh tokens. CUSTOMER_DEV_OTP fixes the SMS code in development (ignored in production).
+  CUSTOMER_ACCESS_TTL_S: z.coerce.number().int().min(60).default(900),
+  CUSTOMER_SESSION_TTL_S: z.coerce.number().int().min(3600).default(30 * 24 * 3600),
+  CUSTOMER_DEV_OTP: z.string().regex(/^\d{6}$/).optional(),
 
   // Rate limiting (per principal, token bucket)
   RATE_LIMIT_ENABLED: bool.default(true),
@@ -95,6 +99,24 @@ const schema = z.object({
   KAFKA_SSL: bool.default(false),
   OUTBOX_BATCH_SIZE: z.coerce.number().int().min(1).max(5000).default(500),
   OUTBOX_POLL_INTERVAL_MS: z.coerce.number().int().min(10).default(200),
+
+  // Text messages. 'console' only logs (development); 'africastalking' sends for real.
+  SMS_PROVIDER: z.enum(['console', 'africastalking']).default('console'),
+  AT_USERNAME: z.string().optional(),
+  AT_API_KEY: z.string().optional(),
+  AT_SENDER_ID: z.string().max(11).optional(),
+  // M-Pesa (Safaricom Daraja). 'off' disables it; 'simulator' answers locally with no network (development only).
+  MPESA_ENV: z.enum(['off', 'simulator', 'sandbox', 'production']).default('off'),
+  MPESA_CONSUMER_KEY: z.string().optional(),
+  MPESA_CONSUMER_SECRET: z.string().optional(),
+  MPESA_SHORTCODE: z.string().regex(/^\d{5,7}$/).optional(),
+  MPESA_PASSKEY: z.string().optional(),
+  // The public address Safaricom calls back (https, no trailing slash), and the secret that goes in the callback path.
+  MPESA_CALLBACK_BASE_URL: z.string().url().optional(),
+  MPESA_CALLBACK_SECRET: z.string().min(24).optional(),
+  // Uploaded files (photos, documents). Local disk now; point this at a mounted volume in production.
+  UPLOAD_DIR: z.string().default('./uploads'),
+  UPLOAD_MAX_BYTES: z.coerce.number().int().min(1024).max(25_000_000).default(5_000_000),
 
   // Observability
   OTEL_ENABLED: bool.default(false),
@@ -138,6 +160,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, role: 'api' | '
       throw new Error('Invalid configuration: one of JWT_JWKS_URL, JWT_PUBLIC_KEY or JWT_PUBLIC_KEY_FILE is required');
     }
   }
+  if (cfg.SMS_PROVIDER === 'africastalking' && !(cfg.AT_USERNAME && cfg.AT_API_KEY)) throw new Error('Invalid configuration: AT_USERNAME and AT_API_KEY are required for SMS_PROVIDER=africastalking');
+  if (cfg.MPESA_ENV === 'sandbox' || cfg.MPESA_ENV === 'production') {
+    const missing = ['MPESA_CONSUMER_KEY', 'MPESA_CONSUMER_SECRET', 'MPESA_SHORTCODE', 'MPESA_PASSKEY', 'MPESA_CALLBACK_BASE_URL', 'MPESA_CALLBACK_SECRET'].filter((k) => !cfg[k as keyof typeof cfg]);
+    if (missing.length) throw new Error(`Invalid configuration: MPESA_ENV=${cfg.MPESA_ENV} needs ${missing.join(', ')}`);
+  }
+  if (cfg.NODE_ENV === 'production' && cfg.MPESA_ENV === 'simulator') throw new Error('Invalid configuration: MPESA_ENV=simulator is for development only');
+  if (cfg.MPESA_ENV === 'simulator' && !cfg.MPESA_CALLBACK_SECRET) throw new Error('Invalid configuration: MPESA_ENV=simulator still needs MPESA_CALLBACK_SECRET (24+ characters)');
   if (cfg.NODE_ENV === 'production' && !cfg.DB_SSL) {
     throw new Error('Invalid configuration: DB_SSL must be true in production');
   }
