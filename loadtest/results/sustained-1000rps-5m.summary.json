@@ -1,0 +1,201 @@
+{
+    "metrics": {
+        "checkout_latency": {
+            "p(95)": 39.91743419999998,
+            "p(99)": 75.40644424000006,
+            "max": 218.735661,
+            "avg": 14.353062066386995,
+            "min": 2.640716,
+            "med": 9.573862,
+            "p(90)": 28.380843200000033,
+            "thresholds": {
+                "p(99)<250": false
+            }
+        },
+        "http_req_connecting": {
+            "p(95)": 0,
+            "p(99)": 0,
+            "max": 11.778331,
+            "avg": 0.00015015907871094203,
+            "min": 0,
+            "med": 0,
+            "p(90)": 0
+        },
+        "http_req_receiving": {
+            "p(90)": 0.310562,
+            "p(95)": 0.4826475,
+            "p(99)": 1.139707699999997,
+            "max": 46.205057,
+            "avg": 0.13978660799877107,
+            "min": 0.009111,
+            "med": 0.052361
+        },
+        "dropped_iterations": {
+            "count": 30,
+            "rate": 0.09999701807858788
+        },
+        "http_req_failed": {
+            "passes": 1460,
+            "fails": 298511,
+            "thresholds": {
+                "rate<0.001": true
+            },
+            "value": 0.004867137156591804
+        },
+        "data_sent": {
+            "count": 148212474,
+            "rate": 494026.84806834115
+        },
+        "data_received": {
+            "count": 618633128,
+            "rate": 2062048.9361543122
+        },
+        "vus": {
+            "value": 6,
+            "min": 0,
+            "max": 48
+        },
+        "http_reqs": {
+            "count": 299971,
+            "rate": 999.8735170017361
+        },
+        "http_req_waiting": {
+            "avg": 5.265931209733624,
+            "min": 0.151073,
+            "med": 2.761651,
+            "p(90)": 11.986548,
+            "p(95)": 17.575451,
+            "p(99)": 35.05166049999999,
+            "max": 218.352414
+        },
+        "http_req_tls_handshaking": {
+            "p(99)": 0,
+            "max": 0,
+            "avg": 0,
+            "min": 0,
+            "med": 0,
+            "p(90)": 0,
+            "p(95)": 0
+        },
+        "http_req_blocked": {
+            "max": 11.844057,
+            "avg": 0.006976087278436859,
+            "min": 0.001116,
+            "med": 0.0043,
+            "p(90)": 0.006064,
+            "p(95)": 0.006833,
+            "p(99)": 0.03452629999999987
+        },
+        "checks": {
+            "fails": 1460,
+            "passes": 298511,
+            "thresholds": {
+                "rate>0.999": true
+            },
+            "value": 0.9951328628434082
+        },
+        "iterations": {
+            "rate": 999.8735170017361,
+            "count": 299971
+        },
+        "orders_created": {
+            "count": 23845,
+            "rate": 79.4809632027976
+        },
+        "http_req_sending": {
+            "avg": 0.047015953332156836,
+            "min": 0.003299,
+            "med": 0.013217,
+            "p(90)": 0.065733,
+            "p(95)": 0.1481325,
+            "p(99)": 0.611727999999995,
+            "max": 28.245043
+        },
+        "http_req_duration{expected_response:true}": {
+            "p(99)": 35.410414100000274,
+            "max": 218.735661,
+            "avg": 5.4652779322872185,
+            "min": 0.47364,
+            "med": 2.956521,
+            "p(90)": 12.237731,
+            "p(95)": 17.887619
+        },
+        "iteration_duration": {
+            "p(95)": 18.1960335,
+            "p(99)": 35.717786399999916,
+            "max": 221.166768,
+            "avg": 5.698988951291966,
+            "min": 0.291163,
+            "med": 3.200555,
+            "p(90)": 12.520812
+        },
+        "http_req_duration": {
+            "p(90)": 12.215826,
+            "p(95)": 17.852619500000003,
+            "p(99)": 35.344340899999914,
+            "max": 218.735661,
+            "avg": 5.452733771064497,
+            "min": 0.174905,
+            "med": 2.946904,
+            "thresholds": {
+                "p(95)<50": false,
+                "p(99)<150": false
+            }
+        },
+        "vus_max": {
+            "min": 50,
+            "max": 65,
+            "value": 65
+        }
+    },
+    "root_group": {
+        "name": "",
+        "path": "",
+        "id": "d41d8cd98f00b204e9800998ecf8427e",
+        "groups": {},
+        "checks": {
+                "product status ok": {
+                    "name": "product status ok",
+                    "path": "::product status ok",
+                    "id": "3b2a179998df44cf4511810d07ba0f2c",
+                    "passes": 155910,
+                    "fails": 829
+                },
+                "my orders status ok": {
+                    "passes": 29873,
+                    "fails": 150,
+                    "name": "my orders status ok",
+                    "path": "::my orders status ok",
+                    "id": "190b4ba770c28f94e38ca363696e015c"
+                },
+                "availability status ok": {
+                    "id": "a3933e49d7fc57b4b02a56a87678649e",
+                    "passes": 29630,
+                    "fails": 144,
+                    "name": "availability status ok",
+                    "path": "::availability status ok"
+                },
+                "list status ok": {
+                    "name": "list status ok",
+                    "path": "::list status ok",
+                    "id": "ca8f0a96f0332b6cd3e3167f33fa65db",
+                    "passes": 44372,
+                    "fails": 236
+                },
+                "checkout status ok": {
+                    "name": "checkout status ok",
+                    "path": "::checkout status ok",
+                    "id": "5a0797ab90e51f7a48be28ead0ec7bfb",
+                    "passes": 23845,
+                    "fails": 0
+                },
+                "order status ok": {
+                    "passes": 14881,
+                    "fails": 101,
+                    "name": "order status ok",
+                    "path": "::order status ok",
+                    "id": "78ccf49326432645704aaa5a6ad46b4c"
+                }
+            }
+    }
+}

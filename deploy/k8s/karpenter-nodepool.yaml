@@ -1,0 +1,60 @@
+# Application node capacity. Karpenter launches nodes within ~45-60s when pending pods appear
+# (HPA scale-up), spreads across the three AZs, and consolidates when load drops.
+# Graviton (arm64) c7g/m7g: best price/performance for Node.js; the image is built multi-arch.
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: shopcore-app
+spec:
+  template:
+    metadata:
+      labels:
+        workload: app
+    spec:
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: shopcore-app
+      requirements:
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["arm64"]
+        - key: karpenter.k8s.aws/instance-family
+          operator: In
+          values: ["c7g", "m7g", "c8g", "m8g"]
+        - key: karpenter.k8s.aws/instance-size
+          operator: In
+          values: ["2xlarge", "4xlarge"]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["on-demand"]   # API tier stays on-demand; spot only for the load generator pool
+        - key: topology.kubernetes.io/zone
+          operator: In
+          values: ["us-east-1a", "us-east-1b", "us-east-1c"]
+      expireAfter: 720h
+  limits:
+    cpu: "600"                    # hard ceiling: ~150 API pods + workers + daemonsets
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 10m
+    budgets:
+      - nodes: "10%"              # never disrupt more than 10% of nodes at once
+---
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: shopcore-app
+spec:
+  amiSelectorTerms:
+    - alias: al2023@latest
+  role: shopcore-production-karpenter-node   # output karpenter_node_role_name
+  subnetSelectorTerms:
+    - tags: { karpenter.sh/discovery: shopcore-production }
+  securityGroupSelectorTerms:
+    - tags: { karpenter.sh/discovery: shopcore-production }
+  metadataOptions:
+    httpTokens: required          # IMDSv2 only
+    httpPutResponseHopLimit: 1    # pods cannot reach node IMDS credentials
+  blockDeviceMappings:
+    - deviceName: /dev/xvda
+      ebs: { volumeSize: 50Gi, volumeType: gp3, encrypted: true }

@@ -1,0 +1,47 @@
+{
+  "label": "checkout-after",
+  "workers": 1,
+  "apiCpus": "0",
+  "host": {
+    "cpus": 2,
+    "model": "Intel(R) Xeon(R) Processor @ 2.10GHz"
+  },
+  "node": "v22.23.4",
+  "slo": {
+    "p95": 50,
+    "p99": 150,
+    "err": 0.001,
+    "achieved": 0.98
+  },
+  "step": "30s",
+  "mix": "checkout",
+  "maxSustainableRps": 0,
+  "rpsPerWorkerAtMax": 0,
+  "steps": [
+    {
+      "offered": 400,
+      "achieved": 398,
+      "requests": 11946,
+      "p50": 8.13,
+      "p95": 132.2,
+      "p99": 225.34,
+      "max": 451.6,
+      "errRate": 0,
+      "checkoutP99": 225.34,
+      "orders": 11946,
+      "droppedIterations": 55,
+      "apiCpuCores": 0.52,
+      "pgCpuCores": 0.63,
+      "redisCpuCores": 0.03,
+      "hostBusyCores": 1.47,
+      "apiRssMb": 153,
+      "k6Exit": 0,
+      "loadGenCpuCores": 0.29,
+      "apiCpuMsPerReq": 1.306,
+      "pgCpuMsPerReq": 1.5823,
+      "redisCpuMsPerReq": 0.0753,
+      "meetsSlo": false
+    }
+  ],
+  "measuredAt": "2026-11-12T04:19:47.311Z"
+}

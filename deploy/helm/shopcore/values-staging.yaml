@@ -1,0 +1,21 @@
+# Staging: production topology. Scaled to production size for certification runs.
+serviceAccount:
+  roleArn: arn:aws:iam::000000000000:role/shopcore-staging-app
+endpoints:
+  JWT_ISSUER: https://cognito-idp.us-east-1.amazonaws.com/us-east-1_STAGING
+  JWT_AUDIENCE: shopcore-api
+  JWT_JWKS_URL: https://cognito-idp.us-east-1.amazonaws.com/us-east-1_STAGING/.well-known/jwks.json
+  KAFKA_BROKERS: b-1.shopcore-staging.kafka.us-east-1.amazonaws.com:9094
+config:
+  # The load generator's synthetic users share few source IPs; per-user limits still apply.
+  RATE_LIMIT_CAPACITY: "100000"
+  RATE_LIMIT_REFILL_PER_SEC: "100000"
+  RATE_LIMIT_WRITE_CAPACITY: "100000"
+  RATE_LIMIT_WRITE_REFILL_PER_SEC: "100000"
+externalSecret:
+  remoteKey: shopcore/staging/app
+api:
+  hpa: { minReplicas: 6, maxReplicas: 150, targetCPUUtilization: 60 }
+ingress:
+  host: api.staging.shop.example.com
+  certificateArn: arn:aws:acm:us-east-1:000000000000:certificate/STAGING

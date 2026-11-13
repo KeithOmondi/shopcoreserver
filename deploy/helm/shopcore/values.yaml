@@ -1,0 +1,96 @@
+# Defaults are safe for a staging cluster. Production overrides live in values-production.yaml.
+image:
+  repository: 000000000000.dkr.ecr.us-east-1.amazonaws.com/shopcore
+  tag: ""            # set by CI to the immutable git SHA; never "latest"
+  pullPolicy: IfNotPresent
+
+serviceAccount:
+  # IRSA role giving pods read access to their Secrets Manager entries and nothing else.
+  roleArn: ""
+
+config:
+  NODE_ENV: production
+  LOG_LEVEL: info
+  ACCESS_LOG_SAMPLE_RATE: "0.01"
+  DB_SSL: "true"
+  DB_POOL_MAX: "10"
+  DB_READ_POOL_MAX: "10"
+  DB_STATEMENT_TIMEOUT_MS: "2000"
+  REDIS_CLUSTER: "true"
+  REDIS_COMMAND_TIMEOUT_MS: "250"
+  JWT_ALGORITHMS: "RS256"
+  RATE_LIMIT_CAPACITY: "100"
+  RATE_LIMIT_REFILL_PER_SEC: "50"
+  RATE_LIMIT_WRITE_CAPACITY: "10"
+  RATE_LIMIT_WRITE_REFILL_PER_SEC: "2"
+  MAX_EVENT_LOOP_DELAY_MS: "200"
+  MAX_EVENT_LOOP_UTILIZATION: "0.95"
+  MAX_INFLIGHT_REQUESTS: "1024"
+  SHUTDOWN_GRACE_MS: "15000"
+  TRUST_PROXY: "1"            # exactly one trusted hop: the internet-facing ALB (never "true" in production)
+  OTEL_ENABLED: "true"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector.observability:4317"
+  OTEL_TRACES_SAMPLER: parentbased_traceidratio
+  OTEL_TRACES_SAMPLER_ARG: "0.05"
+  KAFKA_SSL: "true"
+
+# Non-secret endpoints, set per environment.
+endpoints:
+  JWT_ISSUER: ""
+  JWT_AUDIENCE: shopcore-api
+  JWT_JWKS_URL: ""
+  KAFKA_BROKERS: ""
+
+# Secrets are synced from AWS Secrets Manager by External Secrets Operator; never in values.
+externalSecret:
+  enabled: true
+  secretStore: aws-secrets-manager
+  refreshInterval: 1h
+  # JSON keys: DATABASE_URL (RDS Proxy writer), DATABASE_READ_URL (RDS Proxy reader endpoint),
+  # DATABASE_MIGRATION_URL (direct cluster writer, DDL role), REDIS_URL (rediss://, AUTH token)
+  remoteKey: shopcore/production/app
+
+api:
+  replicas: 6                 # only used when HPA is disabled
+  resources:
+    # Sized from measured cost (docs/CAPACITY.md): one Node process per pod uses ~1 vCPU at
+    # ~1,000-1,600 RPS. No CPU limit: CFS throttling causes latency spikes on bursty Node loads.
+    requests: { cpu: "1", memory: 512Mi }
+    limits: { memory: 768Mi }
+  hpa:
+    enabled: true
+    minReplicas: 6
+    maxReplicas: 40
+    targetCPUUtilization: 60  # leaves headroom for spikes while new pods start (~30-60s incl. node)
+  pdb:
+    minAvailable: 80%
+  terminationGracePeriodSeconds: 45
+  preStopSleepSeconds: 10     # covers endpoint propagation + ALB deregistration before SIGTERM
+  canary:
+    enabled: false            # Argo Rollouts canary with automated analysis (requires Argo Rollouts)
+
+worker:
+  replicas: 2                 # leader-elected; the second replica is a hot standby
+  resources:
+    requests: { cpu: 250m, memory: 256Mi }
+    limits: { memory: 512Mi }
+
+migrations:
+  enabled: true               # Helm pre-install/pre-upgrade hook Job
+
+ingress:
+  enabled: true
+  host: api.example.com
+  certificateArn: ""
+  wafAclArn: ""
+  # ALB slow start ramps traffic onto new pods while JIT + caches warm (measured: cold pods
+  # shed ~0.3% of requests in their first seconds at full share).
+  slowStartSeconds: 60
+  deregistrationDelaySeconds: 30
+
+monitoring:
+  serviceMonitor: true
+  prometheusRules: true
+
+networkPolicy:
+  enabled: true

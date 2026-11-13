@@ -1,0 +1,30 @@
+# Production sizing for 40,000 RPS peak (see docs/CAPACITY.md for the derivation).
+image:
+  repository: 000000000000.dkr.ecr.us-east-1.amazonaws.com/shopcore
+
+serviceAccount:
+  roleArn: arn:aws:iam::000000000000:role/shopcore-production-app
+
+endpoints:
+  JWT_ISSUER: https://cognito-idp.us-east-1.amazonaws.com/us-east-1_EXAMPLE
+  JWT_AUDIENCE: shopcore-api
+  JWT_JWKS_URL: https://cognito-idp.us-east-1.amazonaws.com/us-east-1_EXAMPLE/.well-known/jwks.json
+  KAFKA_BROKERS: b-1.shopcore.kafka.us-east-1.amazonaws.com:9094,b-2.shopcore.kafka.us-east-1.amazonaws.com:9094,b-3.shopcore.kafka.us-east-1.amazonaws.com:9094
+
+api:
+  hpa:
+    # 40k RPS x 0.625 ms CPU/req = 25 vCPU busy; +15% runtime/observability overhead = 28.75 vCPU
+    # -> 48 pods at the 60% CPU target. x1.5 so the surviving 2 of 3 AZs carry the full peak
+    # after losing one AZ -> 72 pods at peak. (Derivation: docs/CAPACITY.md.)
+    minReplicas: 30           # off-peak floor; pre-scale to 72 before known events (RUNBOOK)
+    maxReplicas: 150          # headroom to ~95k RPS before re-planning the data tier
+    targetCPUUtilization: 60
+  pdb:
+    minAvailable: 85%
+  canary:
+    enabled: true
+
+ingress:
+  host: api.shop.example.com
+  certificateArn: arn:aws:acm:us-east-1:000000000000:certificate/EXAMPLE
+  wafAclArn: arn:aws:wafv2:us-east-1:000000000000:regional/webacl/shopcore-production/EXAMPLE

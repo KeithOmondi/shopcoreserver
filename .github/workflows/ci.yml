@@ -1,0 +1,129 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: shopcore_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 2s --health-retries 30
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+    env:
+      TEST_DATABASE_URL: postgres://postgres@127.0.0.1:5432/shopcore_test
+      TEST_REDIS_URL: redis://127.0.0.1:6379/15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22.12, cache: npm }
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm audit --omit=dev --audit-level=high
+      - run: npm run test:unit
+      - run: npm run build
+      # Integration + e2e: real Postgres and Redis, including the concurrency / oversell suite.
+      - run: npx vitest run test/integration test/e2e --coverage
+      - uses: actions/upload-artifact@v4
+        with: { name: coverage, path: coverage/lcov.info }
+
+  perf-smoke:
+    # Regression guard on every PR: a short fixed-rate run must stay within the SLO. Catches
+    # accidental N+1 queries, sync work on the hot path, or a lost cache, before merge.
+    needs: test
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16
+        env: { POSTGRES_HOST_AUTH_METHOD: trust, POSTGRES_DB: shopcore }
+        ports: ["5432:5432"]
+        options: --health-cmd "pg_isready -U postgres" --health-interval 2s --health-retries 30
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+    env:
+      DATABASE_URL: postgres://postgres@127.0.0.1:5432/shopcore
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22.12, cache: npm }
+      - uses: grafana/setup-k6-action@v1
+      - run: npm ci && npm run build
+      - run: npm run migrate && SEED_PRODUCTS=20000 SEED_STOCK=100000000 npm run seed
+      - run: npm run dev:keys && npx tsx scripts/dev-keys.ts tokens 1000 loadtest/data/tokens.txt
+      - name: Run API and fixed-rate load
+        run: |
+          source scripts/env-local.sh
+          export RATE_LIMIT_CAPACITY=1000000000 RATE_LIMIT_REFILL_PER_SEC=1000000000 \
+                 RATE_LIMIT_WRITE_CAPACITY=1000000000 RATE_LIMIT_WRITE_REFILL_PER_SEC=1000000000
+          node dist/src/server.js & sleep 3
+          cd loadtest/k6 && k6 run -e RATE=500 -e DURATION=60s --summary-export ../results/ci-smoke.json load.js
+      - uses: actions/upload-artifact@v4
+        with: { name: perf-smoke, path: loadtest/results/ci-smoke.json }
+
+  image:
+    needs: test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Build multi-arch image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          tags: shopcore:${{ github.sha }}
+          load: false
+          outputs: type=oci,dest=/tmp/image.tar
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Build amd64 for scanning
+        uses: docker/build-push-action@v6
+        with: { context: ., load: true, tags: "shopcore:scan", cache-from: type=gha }
+      - name: Vulnerability scan (fail on fixable HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: shopcore:scan
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+  infra:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with: { terraform_version: 1.9.8 }
+      - run: terraform -chdir=deploy/terraform fmt -check -recursive
+      - run: terraform -chdir=deploy/terraform init -backend=false && terraform -chdir=deploy/terraform validate
+      - uses: aquasecurity/trivy-action@0.28.0
+        with: { scan-type: config, scan-ref: deploy, severity: "HIGH,CRITICAL", exit-code: "1" }
+      - uses: azure/setup-helm@v4
+      - name: Helm lint and schema-validate rendered manifests
+        run: |
+          helm lint deploy/helm/shopcore --set image.tag=ci -f deploy/helm/shopcore/values-production.yaml
+          helm template shopcore deploy/helm/shopcore --set image.tag=ci -f deploy/helm/shopcore/values-production.yaml > /tmp/rendered.yaml
+          curl -sSL https://github.com/yannh/kubeconform/releases/download/v0.7.0/kubeconform-linux-amd64.tar.gz | tar xz
+          ./kubeconform -strict -summary -ignore-missing-schemas \
+            -schema-location default \
+            -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+            /tmp/rendered.yaml deploy/k8s/*.yaml

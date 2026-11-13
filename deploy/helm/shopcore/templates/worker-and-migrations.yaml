@@ -1,0 +1,85 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-worker
+  labels: {{- include "shopcore.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  replicas: {{ .Values.worker.replicas }}
+  selector:
+    matchLabels: {{- include "shopcore.selector" . | nindent 6 }}
+      app.kubernetes.io/component: worker
+  template:
+    metadata:
+      labels: {{- include "shopcore.selector" . | nindent 8 }}
+        app.kubernetes.io/component: worker
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/config.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ .Release.Name }}
+      terminationGracePeriodSeconds: 30
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels: {{- include "shopcore.selector" . | nindent 14 }}
+              app.kubernetes.io/component: worker
+      containers:
+        - name: worker
+          image: {{ include "shopcore.image" . }}
+          args: ["--require", "./dist/src/infra/tracing.js", "dist/src/worker.js"]
+          {{- include "shopcore.env" . | nindent 10 }}
+          ports:
+            - { name: metrics, containerPort: 9464 }
+          livenessProbe:
+            httpGet: { path: /health/live, port: metrics }
+            periodSeconds: 15
+            failureThreshold: 4
+          resources: {{- toYaml .Values.worker.resources | nindent 12 }}
+          {{- include "shopcore.securityContext" . | nindent 10 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-worker
+  labels: {{- include "shopcore.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  clusterIP: None
+  selector: {{- include "shopcore.selector" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+  ports:
+    - { name: metrics, port: 9464, targetPort: metrics }
+{{- if .Values.migrations.enabled }}
+---
+# Runs before new pods roll out. Migrations are expand/contract only, so the currently
+# running version keeps working against the migrated schema (zero-downtime contract).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-migrate-{{ .Release.Revision }}
+  labels: {{- include "shopcore.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 900
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ .Release.Name }}
+      containers:
+        - name: migrate
+          image: {{ include "shopcore.image" . }}
+          args: ["dist/scripts/migrate.js"]
+          env:
+            - name: DATABASE_URL
+              valueFrom: { secretKeyRef: { name: {{ .Release.Name }}-secrets, key: DATABASE_MIGRATION_URL } }
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { memory: 256Mi }
+          {{- include "shopcore.securityContext" . | nindent 10 }}
+{{- end }}

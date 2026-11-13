@@ -1,0 +1,39 @@
+# 40,000 RPS certification run, executed in-cluster by the k6-operator against staging
+# (production-sized; see environments/staging.tfvars). Generators run in a separate namespace
+# on a dedicated spot node pool so they never compete with the system under test.
+#
+#   kubectl create configmap shopcore-k6 -n loadtest \
+#     --from-file=loadtest/k6/ --from-file=loadtest/data/product-ids.json --from-file=loadtest/data/tokens.txt
+#   kubectl apply -f deploy/k8s/loadtest-40k.yaml
+#
+# Each of the 16 runners offers 2,500 RPS (k6 measured at ~0.35 ms CPU per request here, so
+# ~1 vCPU per runner at that rate; 2 vCPU requested for headroom). Pass/fail = the SLO thresholds
+# in loadtest/k6/lib.js, evaluated over the aggregate.
+apiVersion: k6.io/v1alpha1
+kind: TestRun
+metadata:
+  name: shopcore-40k-load
+  namespace: loadtest
+spec:
+  parallelism: 16
+  separate: true
+  script:
+    configMap:
+      name: shopcore-k6
+      file: load.js
+  arguments: >-
+    -e RATE=2500 -e DURATION=30m -e VUS=300 -e MAX_VUS=1500
+    -e BASE_URL=https://api.staging.shop.example.com
+    -e PRODUCTS_FILE=/test/product-ids.json -e TOKENS_FILE=/test/tokens.txt
+    --out experimental-prometheus-rw
+  runner:
+    env:
+      - name: K6_PROMETHEUS_RW_SERVER_URL
+        value: http://prometheus-operated.monitoring:9090/api/v1/write
+      - name: K6_PROMETHEUS_RW_TREND_STATS
+        value: "p(50),p(95),p(99),max"
+    resources:
+      requests: { cpu: "2", memory: 2Gi }
+      limits: { memory: 4Gi }
+    nodeSelector:
+      workload: loadgen

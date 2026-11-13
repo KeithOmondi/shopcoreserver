@@ -1,0 +1,140 @@
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ .Release.Name }}-api
+  labels: {{- include "shopcore.labels" . | nindent 4 }}
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip          # route straight to pod IPs (no extra kube-proxy hop)
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
+    alb.ingress.kubernetes.io/certificate-arn: {{ required "ingress.certificateArn is required" .Values.ingress.certificateArn }}
+    {{- with .Values.ingress.wafAclArn }}
+    alb.ingress.kubernetes.io/wafv2-acl-arn: {{ . }}
+    {{- end }}
+    alb.ingress.kubernetes.io/healthcheck-path: /health/ready
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "5"
+    alb.ingress.kubernetes.io/healthy-threshold-count: "2"
+    alb.ingress.kubernetes.io/unhealthy-threshold-count: "2"
+    alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=60,routing.http.drop_invalid_header_fields.enabled=true,routing.http2.enabled=true
+    alb.ingress.kubernetes.io/target-group-attributes: >-
+      deregistration_delay.timeout_seconds={{ .Values.ingress.deregistrationDelaySeconds }},slow_start.duration_seconds={{ .Values.ingress.slowStartSeconds }},load_balancing.algorithm.type=least_outstanding_requests
+spec:
+  ingressClassName: alb
+  rules:
+    - host: {{ .Values.ingress.host }}
+      http:
+        paths:
+          - path: /v1
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ .Release.Name }}-api
+                port: { name: http }
+{{- end }}
+{{- if .Values.networkPolicy.enabled }}
+---
+# Default-deny ingress to app pods except from the ALB (VPC CIDR) on http and Prometheus on metrics.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}
+spec:
+  podSelector:
+    matchLabels: {{- include "shopcore.selector" . | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - ports: [{ port: 8080 }]
+    - from:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: monitoring } }
+      ports: [{ port: 9464 }]
+{{- end }}
+{{- if .Values.monitoring.serviceMonitor }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ .Release.Name }}
+  labels: {{- include "shopcore.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels: {{- include "shopcore.selector" . | nindent 6 }}
+  endpoints:
+    - port: metrics
+      interval: 15s
+{{- end }}
+{{- if .Values.monitoring.prometheusRules }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ .Release.Name }}-slo
+  labels: {{- include "shopcore.labels" . | nindent 4 }}
+spec:
+  groups:
+    - name: shopcore.slo
+      rules:
+        # Availability SLO 99.95% over 30d. Multi-window burn-rate alerts (Google SRE workbook).
+        - record: shopcore:errors:ratio_rate5m
+          expr: |
+            sum(rate(http_request_duration_seconds_count{status=~"5..",route!~"/health.*"}[5m]))
+            / clamp_min(sum(rate(http_request_duration_seconds_count{route!~"/health.*"}[5m])), 1)
+        - record: shopcore:errors:ratio_rate1h
+          expr: |
+            sum(rate(http_request_duration_seconds_count{status=~"5..",route!~"/health.*"}[1h]))
+            / clamp_min(sum(rate(http_request_duration_seconds_count{route!~"/health.*"}[1h])), 1)
+        - alert: ShopcoreErrorBudgetFastBurn
+          expr: shopcore:errors:ratio_rate5m > (14.4 * 0.0005) and shopcore:errors:ratio_rate1h > (14.4 * 0.0005)
+          for: 2m
+          labels: { severity: page }
+          annotations:
+            summary: Error budget burning 14x (2% of 30d budget per hour)
+            runbook: docs/RUNBOOK.md#high-error-rate
+        - alert: ShopcoreHighLatencyP99
+          expr: histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket{route!~"/health.*"}[5m]))) > 0.15
+          for: 10m
+          labels: { severity: page }
+          annotations:
+            summary: p99 latency above 150 ms for 10 minutes
+            runbook: docs/RUNBOOK.md#high-latency
+        - alert: ShopcoreLoadShedding
+          expr: sum(rate(load_shed_total[5m])) > 50
+          for: 5m
+          labels: { severity: page }
+          annotations:
+            summary: Pods are shedding load; HPA is not keeping up or maxReplicas reached
+            runbook: docs/RUNBOOK.md#load-shedding
+        - alert: ShopcoreCircuitOpen
+          expr: max by (name) (circuit_breaker_state) == 2
+          for: 1m
+          labels: { severity: page }
+          annotations:
+            summary: Circuit breaker {{`{{ $labels.name }}`}} is open
+            runbook: docs/RUNBOOK.md#dependency-outage
+        - alert: ShopcoreDbPoolSaturated
+          expr: max(db_pool_connections{state="waiting"}) > 5
+          for: 5m
+          labels: { severity: warn }
+          annotations:
+            summary: Requests are waiting for DB connections
+        - alert: ShopcoreOutboxLag
+          expr: max(outbox_oldest_event_age_seconds) > 60
+          for: 5m
+          labels: { severity: page }
+          annotations:
+            summary: Outbox events are not being relayed to Kafka
+            runbook: docs/RUNBOOK.md#outbox-lag
+        - alert: ShopcoreHpaAtMax
+          expr: kube_horizontalpodautoscaler_status_current_replicas{horizontalpodautoscaler=~".*shopcore.*"} >= kube_horizontalpodautoscaler_spec_max_replicas{horizontalpodautoscaler=~".*shopcore.*"}
+          for: 10m
+          labels: { severity: warn }
+          annotations:
+            summary: API is at max replicas; raise maxReplicas or check the data tier
+        - alert: ShopcoreTxRetriesHigh
+          expr: sum(rate(db_tx_retries_total[5m])) > 20
+          for: 10m
+          labels: { severity: warn }
+          annotations:
+            summary: Elevated deadlock/serialization retries (hot-row contention?)
+{{- end }}

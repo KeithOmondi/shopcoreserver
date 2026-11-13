@@ -1,0 +1,12 @@
+environment                  = "production"
+region                       = "us-east-1"
+dr_region                    = "us-west-2"
+azs                          = ["us-east-1a", "us-east-1b", "us-east-1c"]
+aurora_instance_class        = "db.r7g.4xlarge"
+aurora_reader_instance_class = "db.r7g.2xlarge"
+aurora_reader_count          = 2
+aurora_reader_max            = 6
+redis_node_type              = "cache.r7g.xlarge"
+redis_shards                 = 6
+msk_instance_type            = "kafka.m7g.large"
+enable_aurora_global         = true

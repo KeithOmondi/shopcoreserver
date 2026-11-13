@@ -1,0 +1,7 @@
+apiVersion: v2
+name: shopcore
+description: ShopCore e-commerce orders API, background worker and schema migrations
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+kubeVersion: ">=1.30.0-0"  # preStop sleep action (distroless image has no shell)

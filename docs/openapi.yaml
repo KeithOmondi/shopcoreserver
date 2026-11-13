@@ -1,0 +1,285 @@
+openapi: 3.1.0
+info:
+  title: ShopCore API
+  version: 1.0.0
+  description: >
+    Catalog, inventory and order management. Authentication is a bearer JWT issued by the
+    identity provider. Errors always use the `Error` envelope. Hand-maintained alongside
+    docs/API.md; the zod schemas in src/ are the source of truth.
+servers:
+  - url: https://api.shop.example.com
+security:
+  - bearer: []
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    Id:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+    Cursor:
+      name: cursor
+      in: query
+      schema: { type: string, maxLength: 200 }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: { type: string, pattern: '^[A-Za-z0-9_-]{8,128}$' }
+  responses:
+    Error:
+      description: Error
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+  schemas:
+    Error:
+      type: object
+      required: [error, requestId]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              examples: [VALIDATION_FAILED, UNAUTHORIZED, FORBIDDEN, NOT_FOUND, RATE_LIMITED, INSUFFICIENT_STOCK, PAYMENT_AMOUNT_MISMATCH, ORDER_CANCELLED, SERVICE_UNAVAILABLE]
+            message: { type: string }
+            details: {}
+        requestId: { type: string }
+    Product:
+      type: object
+      required: [id, sku, name, description, priceCents, currency, active, version, createdAt, updatedAt]
+      properties:
+        id: { type: string, format: uuid }
+        sku: { type: string, pattern: '^[A-Z0-9][A-Z0-9_-]{0,63}$' }
+        name: { type: string, maxLength: 200 }
+        description: { type: string, maxLength: 5000 }
+        priceCents: { type: integer, minimum: 0 }
+        currency: { type: string, pattern: '^[A-Z]{3}$' }
+        active: { type: boolean }
+        version: { type: integer, minimum: 1 }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+    ProductPage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Product' } }
+        nextCursor: { type: [string, 'null'] }
+    CreateProduct:
+      type: object
+      additionalProperties: false
+      required: [sku, name, priceCents, currency]
+      properties:
+        sku: { type: string, pattern: '^[A-Z0-9][A-Z0-9_-]{0,63}$' }
+        name: { type: string, minLength: 1, maxLength: 200 }
+        description: { type: string, maxLength: 5000, default: '' }
+        priceCents: { type: integer, minimum: 0 }
+        currency: { type: string, pattern: '^[A-Z]{3}$' }
+        initialStock: { type: integer, minimum: 0, maximum: 10000000, default: 0 }
+    UpdateProduct:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        name: { type: string, minLength: 1, maxLength: 200 }
+        description: { type: string, maxLength: 5000 }
+        priceCents: { type: integer, minimum: 0 }
+        active: { type: boolean }
+    StockAdjustment:
+      type: object
+      additionalProperties: false
+      required: [delta, reason]
+      properties:
+        delta: { type: integer, not: { const: 0 } }
+        reason: { type: string, minLength: 3, maxLength: 200 }
+    OrderStatus:
+      type: string
+      enum: [PENDING_PAYMENT, PAID, CANCELLED, FULFILLED]
+    OrderItem:
+      type: object
+      properties:
+        lineNo: { type: integer }
+        productId: { type: string, format: uuid }
+        sku: { type: string }
+        name: { type: string }
+        quantity: { type: integer, minimum: 1 }
+        unitPriceCents: { type: integer }
+    Order:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        userId: { type: string, format: uuid }
+        status: { $ref: '#/components/schemas/OrderStatus' }
+        totalCents: { type: integer }
+        currency: { type: string }
+        itemCount: { type: integer }
+        version: { type: integer }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        items: { type: array, items: { $ref: '#/components/schemas/OrderItem' } }
+    OrderSummary:
+      allOf:
+        - { $ref: '#/components/schemas/Order' }
+        - { type: object, description: 'items omitted in list responses' }
+    CreateOrder:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          minItems: 1
+          maxItems: 50
+          description: Unique productIds only.
+          items:
+            type: object
+            additionalProperties: false
+            required: [productId, quantity]
+            properties:
+              productId: { type: string, format: uuid }
+              quantity: { type: integer, minimum: 1, maximum: 100 }
+    CancelOrder:
+      type: object
+      additionalProperties: false
+      properties:
+        reason: { type: string, minLength: 1, maxLength: 200, default: customer_request }
+    PaymentConfirmation:
+      type: object
+      additionalProperties: false
+      required: [paymentRef, amountCents, currency]
+      properties:
+        paymentRef: { type: string, minLength: 1, maxLength: 128 }
+        amountCents: { type: integer, minimum: 0, description: Must equal the order total. }
+        currency: { type: string, pattern: '^[A-Z]{3}$' }
+paths:
+  /v1/products:
+    get:
+      summary: List active products (cursor pagination)
+      security: []
+      parameters: [{ $ref: '#/components/parameters/Limit' }, { $ref: '#/components/parameters/Cursor' }]
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/ProductPage' } } } }
+        default: { $ref: '#/components/responses/Error' }
+    post:
+      summary: Create a product (admin)
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/CreateProduct' } } } }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/Product' } } } }
+        '409': { $ref: '#/components/responses/Error' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/products/{id}:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    get:
+      summary: Get a product
+      security: []
+      parameters:
+        - { name: If-None-Match, in: header, schema: { type: string } }
+      responses:
+        '200': { description: OK (ETag = version), content: { application/json: { schema: { $ref: '#/components/schemas/Product' } } } }
+        '304': { description: Not modified }
+        default: { $ref: '#/components/responses/Error' }
+    patch:
+      summary: Update a product (admin, optimistic concurrency)
+      parameters:
+        - { name: If-Match, in: header, required: true, schema: { type: string }, description: 'The product version you read, e.g. "3"' }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/UpdateProduct' } } } }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Product' } } } }
+        '409': { $ref: '#/components/responses/Error' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/products/{id}/availability:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    get:
+      summary: Current available stock (uncached)
+      security: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  productId: { type: string, format: uuid }
+                  available: { type: integer }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/products/{id}/stock-adjustments:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    post:
+      summary: Adjust stock (admin, audited)
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/StockAdjustment' } } } }
+      responses:
+        '200': { description: OK }
+        '422': { $ref: '#/components/responses/Error' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/orders:
+    post:
+      summary: Create an order (idempotent)
+      parameters: [{ $ref: '#/components/parameters/IdempotencyKey' }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/CreateOrder' } } } }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/Order' } } } }
+        '200': { description: Replay of an earlier request with the same key (idempotent-replayed header) }
+        '409': { description: INSUFFICIENT_STOCK, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '422': { description: PRODUCT_UNAVAILABLE / MIXED_CURRENCY / IDEMPOTENCY_KEY_REUSED, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        default: { $ref: '#/components/responses/Error' }
+    get:
+      summary: The caller's orders, newest first
+      parameters: [{ $ref: '#/components/parameters/Limit' }, { $ref: '#/components/parameters/Cursor' }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/OrderSummary' } }
+                  nextCursor: { type: [string, 'null'] }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/orders/{id}:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    get:
+      summary: Get an order (owner or admin)
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Order' } } } }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/orders/{id}/cancel:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    post:
+      summary: Cancel from PENDING_PAYMENT or PAID (owner or admin)
+      description: Cancelling a PAID order returns stock and emits OrderCancelled with refundRequired=true.
+      requestBody: { content: { application/json: { schema: { $ref: '#/components/schemas/CancelOrder' } } } }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Order' } } } }
+        '409': { $ref: '#/components/responses/Error' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/orders/{id}/payment-confirmation:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    post:
+      summary: Confirm a successful charge (payments role)
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/PaymentConfirmation' } } } }
+      responses:
+        '200': { description: PAID (idempotent per paymentRef), content: { application/json: { schema: { $ref: '#/components/schemas/Order' } } } }
+        '409': { description: 'ORDER_ALREADY_PAID, PAYMENT_REF_REUSED, or ORDER_CANCELLED (payment recorded for refund)', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '422': { description: PAYMENT_AMOUNT_MISMATCH, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/orders/{id}/fulfillment:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    post:
+      summary: Mark a PAID order shipped (admin)
+      responses:
+        '200': { description: FULFILLED, content: { application/json: { schema: { $ref: '#/components/schemas/Order' } } } }
+        '409': { $ref: '#/components/responses/Error' }
+        default: { $ref: '#/components/responses/Error' }

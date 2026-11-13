@@ -1,0 +1,101 @@
+name: cd
+
+# main -> build & push immutable image -> staging (deploy + smoke + load gate) -> production
+# (manual approval via the "production" environment, canary with automated analysis).
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      rollback_to:
+        description: "Image tag (git SHA) to roll production back to"
+        required: false
+
+permissions:
+  id-token: write   # OIDC to AWS: no long-lived cloud credentials in GitHub
+  contents: read
+
+concurrency:
+  group: cd-production
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPO: shopcore
+
+jobs:
+  build:
+    if: ${{ !inputs.rollback_to }}
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_CI_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ github.sha }}
+          provenance: true
+          sbom: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  staging:
+    needs: build
+    runs-on: [self-hosted, staging-vpc]   # runner inside the VPC: the EKS API is private
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with: { role-to-assume: "${{ vars.AWS_DEPLOY_ROLE_ARN }}", aws-region: "${{ env.AWS_REGION }}" }
+      - run: aws eks update-kubeconfig --name shopcore-staging
+      - name: Deploy (migrations run first as a pre-upgrade hook)
+        run: |
+          helm upgrade --install shopcore deploy/helm/shopcore -n shopcore --create-namespace \
+            -f deploy/helm/shopcore/values-staging.yaml --set image.tag=${{ needs.build.outputs.tag }} \
+            --atomic --timeout 15m --wait
+      - name: Smoke test
+        run: |
+          for p in /health/ready /v1/products?limit=1; do
+            curl -fsS --retry 5 --retry-delay 3 "https://api.staging.shop.example.com$p" > /dev/null
+          done
+      - name: Load gate (10 min at 20k RPS, SLO thresholds must pass)
+        run: |
+          kubectl -n loadtest delete testrun shopcore-gate --ignore-not-found
+          sed -e 's/shopcore-40k-load/shopcore-gate/' -e 's/parallelism: 16/parallelism: 8/' \
+              -e 's/DURATION=30m/DURATION=10m/' deploy/k8s/loadtest-40k.yaml | kubectl apply -f -
+          kubectl -n loadtest wait testrun/shopcore-gate --for=jsonpath='{.status.stage}'=finished --timeout=20m
+          ./scripts/ci/assert-k6-passed.sh shopcore-gate
+
+  production:
+    needs: [build, staging]
+    if: ${{ always() && (needs.staging.result == 'success' || inputs.rollback_to) }}
+    runs-on: [self-hosted, production-vpc]
+    environment: production          # requires manual approval
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with: { role-to-assume: "${{ vars.AWS_DEPLOY_ROLE_ARN }}", aws-region: "${{ env.AWS_REGION }}" }
+      - run: aws eks update-kubeconfig --name shopcore-production
+      - name: Deploy (canary 5% -> 25% -> 50% -> 100%, auto-abort on SLO breach)
+        env:
+          TAG: ${{ inputs.rollback_to || needs.build.outputs.tag }}
+        run: |
+          helm upgrade --install shopcore deploy/helm/shopcore -n shopcore \
+            -f deploy/helm/shopcore/values-production.yaml --set image.tag=$TAG --timeout 20m --wait
+          kubectl argo rollouts status shopcore-api -n shopcore --timeout 45m
+      - name: Roll back on failed rollout
+        if: failure()
+        run: |
+          kubectl argo rollouts abort shopcore-api -n shopcore || true
+          helm rollback shopcore 0 -n shopcore --wait --timeout 15m

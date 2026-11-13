@@ -1,0 +1,9 @@
+node_modules
+dist
+coverage
+.dev-keys
+loadtest/data
+loadtest/results/*.raw.json
+*.log
+.env
+.env.example

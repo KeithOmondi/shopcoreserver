@@ -1,0 +1,12 @@
+node_modules
+dist
+coverage
+.git
+.github
+.dev-keys
+.env
+*.log
+loadtest
+deploy
+docs
+test
