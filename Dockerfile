@@ -2,7 +2,7 @@
 # Multi-stage build: compile with dev deps, ship only prod deps + compiled JS on distroless.
 # Final image: no shell, no package manager, runs as non-root (uid 65532).
 
-FROM node:22.12-bookworm-slim AS build
+FROM node:22-bookworm-slim AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN --mount=type=cache,target=/root/.npm npm ci --ignore-scripts

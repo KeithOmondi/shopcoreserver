@@ -163,15 +163,28 @@ const schema = z.object({
 
 export type Config = z.infer<typeof schema> & { JWT_ISSUER: string; JWT_AUDIENCE: string };
 
+function readKeyFile(name: string, file: string): string {
+  try {
+    return readFileSync(file, 'utf8');
+  } catch {
+    throw new Error(`${name}_FILE points at ${file}, which does not exist here. On a host, set ${name} to the key itself (see .env.render) and remove ${name}_FILE.`);
+  }
+}
+
 /**
  * role=api requires token-verification settings; role=worker does not (it never sees user requests).
  */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env, role: 'api' | 'worker' = 'api'): Config {
   if (!env.JWT_PUBLIC_KEY && env.JWT_PUBLIC_KEY_FILE) {
-    env = { ...env, JWT_PUBLIC_KEY: readFileSync(env.JWT_PUBLIC_KEY_FILE, 'utf8') };
+    env = { ...env, JWT_PUBLIC_KEY: readKeyFile('JWT_PUBLIC_KEY', env.JWT_PUBLIC_KEY_FILE) };
   }
   if (!env.STAFF_JWT_PRIVATE_KEY && env.STAFF_JWT_PRIVATE_KEY_FILE) {
-    env = { ...env, STAFF_JWT_PRIVATE_KEY: readFileSync(env.STAFF_JWT_PRIVATE_KEY_FILE, 'utf8') };
+    env = { ...env, STAFF_JWT_PRIVATE_KEY: readKeyFile('STAFF_JWT_PRIVATE_KEY', env.STAFF_JWT_PRIVATE_KEY_FILE) };
+  }
+  // A key pasted on one line (as many hosts' .env import does) arrives with a literal \n between its lines. Put real line breaks back.
+  for (const k of ['JWT_PUBLIC_KEY', 'STAFF_JWT_PRIVATE_KEY'] as const) {
+    const v = env[k];
+    if (v && v.includes('\\n') && !v.includes('\n')) env = { ...env, [k]: v.replace(/\\n/g, '\n') };
   }
   const parsed = schema.safeParse(env);
   if (!parsed.success) {
