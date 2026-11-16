@@ -9,10 +9,16 @@ import { AppError, ConflictError, ForbiddenError, NotFoundError, UnauthorizedErr
 import { isUuid, uuidv7 } from '../../infra/uuid.js';
 import { audit, type Actor } from '../products/products.js';
 import { dummyHash, hashPassword, verifyPassword } from '../staff/password.js';
+import { LANGUAGES, RIDER_PUSH_KINDS, queuePush } from '../integrations/push.js';
+import { programme } from './money.js';
 
 const uuid = z.string().refine(isUuid, 'must be a UUID');
-export const DOC_KEYS = ['id', 'license', 'insurance', 'photo', 'selfie'] as const;
-const DOC_TITLES: Record<(typeof DOC_KEYS)[number], string> = { id: 'National ID', license: 'Driving license', insurance: 'Vehicle insurance', photo: 'Vehicle photo', selfie: 'Selfie check' };
+export const DOC_KEYS = ['id', 'license', 'insurance', 'logbook', 'photo', 'selfie', 'kra', 'conduct'] as const;
+/** Papers that only make sense with a motor vehicle. A bicycle rider is never asked for them. */
+const MOTOR_DOCS: readonly string[] = ['license', 'insurance', 'logbook'];
+/** Papers that carry an expiry date the rider must give. */
+const DATED_DOCS: readonly string[] = ['license', 'insurance'];
+const DOC_TITLES: Record<(typeof DOC_KEYS)[number], string> = { id: 'National ID', license: 'Driving license', insurance: 'Vehicle insurance', logbook: 'Vehicle logbook', kra: 'KRA PIN certificate', conduct: 'Certificate of good conduct', photo: 'Vehicle photo', selfie: 'Selfie check' };
 
 /** Messages go out through this. Production wires a real SMS provider; development just logs. */
 export interface SmsSender { send(phone: string, text: string): Promise<void> }
@@ -34,13 +40,17 @@ const riderPassword = z.string().min(8).max(128).refine((p) => /[A-Za-z]/.test(p
 export const CodeRequestSchema = z.strictObject({ phone, purpose: z.enum(['signup', 'reset']) });
 export const CodeVerifySchema = z.strictObject({ phone, purpose: z.enum(['signup', 'reset']), code: z.string().regex(/^\d{6}$/) });
 export const RegisterSchema = z.strictObject({
-  phone, password: riderPassword, name: z.string().trim().min(2).max(120), nationalId: z.string().trim().max(20).default(''), county: z.string().trim().max(60).default(''),
+  phone, password: riderPassword, name: z.string().trim().min(2).max(120), email: z.string().trim().toLowerCase().max(160).default(''), referralCode: z.string().trim().toUpperCase().max(20).optional(), kraPin: z.string().trim().toUpperCase().regex(/^[AP][0-9]{9}[A-Z]$/, 'Enter your KRA PIN, like A123456789B'), emergencyName: z.string().trim().min(2).max(120), emergencyRelation: z.string().trim().min(2).max(60), emergencyPhone: phone, payoutPhone: phone.optional(), payoutName: z.string().trim().max(120).default(''), nationalId: z.string().trim().max(20).default(''), county: z.string().trim().max(60).default(''),
   vehicle: z.enum(['Motorbike', 'Bicycle', 'Car']).default('Motorbike'), plate: z.string().trim().toUpperCase().max(12).default(''), zoneId: uuid.optional(),
 });
 export const RiderLoginSchema = z.strictObject({ phone, password: z.string().min(1).max(128) });
 export const RiderResetSchema = z.strictObject({ phone, code: z.string().regex(/^\d{6}$/), password: riderPassword });
 export const RiderRefreshSchema = z.strictObject({ refreshToken: z.string().min(20).max(200) });
 export const SubmitDocSchema = z.strictObject({ fileRef: z.string().trim().min(1).max(300), expiresOn: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional() });
+export const PayoutDetailsSchema = z.strictObject({ payoutPhone: phone, payoutName: z.string().trim().min(2).max(120), password: z.string().min(1).max(128) });
+export const RiderDetailsSchema = z.strictObject({ email: z.string().trim().toLowerCase().email().max(160), emergencyName: z.string().trim().min(2).max(120), emergencyRelation: z.string().trim().min(2).max(60), emergencyPhone: phone });
+export const PrefsSchema = z.strictObject({ language: z.enum(LANGUAGES).optional(), notify: z.strictObject({ requests: z.boolean(), payouts: z.boolean(), documents: z.boolean(), account: z.boolean() }).partial().optional() }).refine((v) => v.language || v.notify, 'nothing to change');
+export const RatingPageSchema = z.object({ limit: z.coerce.number().int().min(1).max(100).default(30) });
 export const AvailabilitySchema = z.strictObject({ online: z.boolean(), lat: z.number().min(-90).max(90).optional(), lng: z.number().min(-180).max(180).optional() });
 export const PingSchema = z.strictObject({ lat: z.number().min(-90).max(90), lng: z.number().min(-180).max(180) });
 
@@ -66,7 +76,7 @@ export const ShiftQuerySchema = z.object({ from: z.string().regex(/^\d{4}-\d{2}-
 interface RiderRow {
   id: string; phone: string; name: string; email: string; national_id: string; county: string; vehicle: string; plate: string; zone_id: string | null; zone: string | null; account_status: string;
   availability: string; rating: string; deliveries_done: number; review_note: string; rejected_doc: string | null; reviewed_by: string | null; reviewed_at: Date | null; applied_at: Date;
-  welcomed: boolean; last_lat: number | null; last_lng: number | null; last_seen_at: Date | null; created_at: Date; version: number;
+  welcomed: boolean; language: string; notify: Record<string, boolean>; referral_code: string; kra_pin: string; emergency_name: string; emergency_relation: string; emergency_phone: string; payout_phone: string; payout_name: string; last_lat: number | null; last_lng: number | null; last_seen_at: Date | null; created_at: Date; version: number;
   cash_held: number; earnings: number; live: number;
 }
 const RIDER_SELECT = `SELECT r.*, z.name AS zone,
@@ -75,7 +85,7 @@ const RIDER_SELECT = `SELECT r.*, z.name AS zone,
     (SELECT count(*) FROM deliveries d WHERE d.rider_id = r.id AND d.status IN ('accepted','at_pickup','picked_up','at_dropoff'))::int AS live
   FROM riders r LEFT JOIN zones z ON z.id = r.zone_id`;
 const view = (r: RiderRow) => ({
-  id: r.id, phone: r.phone, name: r.name, email: r.email, nationalId: r.national_id, county: r.county, vehicle: r.vehicle, plate: r.plate, zoneId: r.zone_id, zone: r.zone,
+  id: r.id, phone: r.phone, name: r.name, email: r.email, nationalId: r.national_id, kraPin: r.kra_pin, emergency: { name: r.emergency_name, relation: r.emergency_relation, phone: r.emergency_phone }, county: r.county, vehicle: r.vehicle, plate: r.plate, zoneId: r.zone_id, zone: r.zone,
   status: r.account_status, availability: r.account_status === 'approved' ? r.availability : 'offline', rating: Number(r.rating), deliveries: r.deliveries_done,
   cashHeldCents: Number(r.cash_held), earningsBalanceCents: Number(r.earnings), activeDeliveries: r.live, appliedAt: r.applied_at.toISOString(), joinedAt: r.created_at.toISOString(),
   reviewNote: r.review_note, reviewedBy: r.reviewed_by, reviewedAt: r.reviewed_at?.toISOString() ?? null,
@@ -142,7 +152,7 @@ export class RidersService {
   }
 
   private async consumeVerified(c: Queryable, p: string, purpose: 'signup' | 'reset') {
-    const r = (await c.query<{ ok: boolean }>(`DELETE FROM rider_otps WHERE phone = $1 AND purpose = $2 AND verified_at IS NOT NULL AND verified_at > now() - interval '30 minutes' RETURNING true AS ok`, [p, purpose])).rows[0];
+    const r = (await c.query<{ ok: boolean }>(`DELETE FROM rider_otps WHERE phone = $1 AND purpose = $2 AND verified_at IS NOT NULL AND verified_at > now() - interval '2 hours' RETURNING true AS ok`, [p, purpose])).rows[0];
     if (!r) throw new UnprocessableError('CODE_NOT_VERIFIED', 'Verify your phone number first');
   }
 
@@ -151,11 +161,23 @@ export class RidersService {
     const hash = await hashPassword(input.password);
     const out = await this.db.tx(async (c) => {
       await this.consumeVerified(c, input.phone, 'signup');
+      let referrer: string | null = null;
+      if (input.referralCode) {
+        referrer = (await c.query<{ id: string }>(`SELECT id FROM riders WHERE referral_code = $1 AND account_status <> 'suspended'`, [input.referralCode])).rows[0]?.id ?? null;
+        if (!referrer) throw new ValidationError([{ path: ['referralCode'], message: 'That referral code isn’t right. Check it with the rider who invited you.' }]);
+      }
+      let code = '';
+      for (let i = 0; i < 10 && !code; i++) {
+        const tryCode = Array.from({ length: 8 }, () => 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'[randomInt(32)]).join('');
+        if (!(await c.query('SELECT 1 FROM riders WHERE referral_code = $1', [tryCode])).rowCount) code = tryCode;
+      }
+      if (!code) throw new AppError('CODE_FAILED', 'Could not create your account. Try again.', 500);
       if (input.zoneId && !(await c.query('SELECT 1 FROM zones WHERE id = $1', [input.zoneId])).rowCount) throw new ValidationError([{ path: ['zoneId'], message: 'Unknown zone' }]);
-      await c.query('INSERT INTO riders (id, phone, name, national_id, county, vehicle, plate, zone_id, password_hash) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)',
-        [id, input.phone, input.name, input.nationalId, input.county, input.vehicle, input.plate, input.zoneId ?? null, hash])
+      await c.query('INSERT INTO riders (id, phone, name, email, national_id, county, vehicle, plate, zone_id, password_hash, payout_phone, payout_name, kra_pin, emergency_name, emergency_relation, emergency_phone, referral_code, referred_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)',
+        [id, input.phone, input.name, input.email, input.nationalId, input.county, input.vehicle, input.plate, input.zoneId ?? null, hash, input.payoutPhone ?? input.phone, input.payoutName || input.name, input.kraPin, input.emergencyName, input.emergencyRelation, input.emergencyPhone, code, referrer])
         .catch((e: { code?: string }) => { if (e.code === '23505') throw new ConflictError('PHONE_EXISTS', 'This number already has a rider account. Log in instead.'); throw e; });
-      for (const k of DOC_KEYS) await c.query(`INSERT INTO rider_docs (rider_id, key, state, note) VALUES ($1,$2,'pending','')`, [id, k]);
+      // A bicycle needs no license, insurance or logbook, so those are never asked for.
+      for (const k of DOC_KEYS.filter((d) => input.vehicle !== 'Bicycle' || !MOTOR_DOCS.includes(d))) await c.query(`INSERT INTO rider_docs (rider_id, key, state, note) VALUES ($1,$2,'pending','')`, [id, k]);
       return this.startSession(c, id, device);
     });
     return this.tokens(id, out.id, out.refresh);
@@ -178,12 +200,12 @@ export class RidersService {
     return this.db.read(async (c) => {
       const r = (await c.query<RiderRow>(`${RIDER_SELECT} WHERE r.id = $1`, [riderId])).rows[0];
       if (!r) throw new NotFoundError('Rider');
-      const docs = (await c.query<{ key: string; state: string; note: string; expires_on: string | null }>(`SELECT key, state, note, to_char(expires_on,'YYYY-MM-DD') AS expires_on FROM rider_docs WHERE rider_id = $1`, [riderId])).rows;
+      const docs = (await c.query<{ key: string; state: string; note: string; expires_on: string | null; uploaded: boolean }>(`SELECT key, state, note, to_char(expires_on,'YYYY-MM-DD') AS expires_on, (file_ref IS NOT NULL) AS uploaded FROM rider_docs WHERE rider_id = $1`, [riderId])).rows;
       const bad = docs.find((d) => d.key === r.rejected_doc);
       return {
-        id: r.id, phone: r.phone, name: r.name, status: r.account_status, welcomed: r.welcomed, vehicle: r.vehicle, plate: r.plate, zone: r.zone, rating: Number(r.rating), online: r.availability === 'online',
+        id: r.id, phone: r.phone, name: r.name, status: r.account_status, welcomed: r.welcomed, language: r.language, notify: Object.fromEntries(RIDER_PUSH_KINDS.map((k) => [k, r.notify?.[k] !== false])), referralCode: r.referral_code, suspendedReason: r.account_status === 'suspended' ? r.review_note : '', email: r.email, county: r.county, nationalId: r.national_id, kraPin: r.kra_pin, emergencyName: r.emergency_name, emergencyRelation: r.emergency_relation, emergencyPhone: r.emergency_phone, payoutPhone: r.payout_phone || r.phone, payoutName: r.payout_name || r.name, vehicle: r.vehicle, plate: r.plate, zone: r.zone, rating: Number(r.rating), online: r.availability === 'online',
         rejection: r.account_status === 'rejected' ? { document: r.rejected_doc, title: r.rejected_doc ? `${DOC_TITLES[r.rejected_doc as keyof typeof DOC_TITLES]} needs another look` : 'Application not approved', message: r.review_note, detail: bad?.note ?? '' } : undefined,
-        documents: DOC_KEYS.map((k) => ({ key: k, title: DOC_TITLES[k], ...(docs.find((d) => d.key === k) ?? { state: 'pending', note: '', expires_on: null }) })).map((d) => ({ key: d.key, title: d.title, state: d.state, note: d.note, expiresOn: d.expires_on })),
+        documents: DOC_KEYS.filter((k) => docs.length === 0 || docs.some((d) => d.key === k)).map((k) => ({ key: k, title: DOC_TITLES[k], ...(docs.find((d) => d.key === k) ?? { state: 'pending', note: '', expires_on: null, uploaded: false }) })).map((d) => ({ key: d.key, title: d.title, state: d.state, note: d.note, expiresOn: d.expires_on, uploaded: d.uploaded })),
       };
     });
   }
@@ -256,15 +278,90 @@ export class RidersService {
   }
 
   async submitDoc(ctx: RiderContext, key: (typeof DOC_KEYS)[number], input: z.infer<typeof SubmitDocSchema>) {
+    if (DATED_DOCS.includes(key)) {
+      if (!input.expiresOn) throw new ValidationError([{ path: ['expiresOn'], message: `Enter the date your ${DOC_TITLES[key].toLowerCase()} expires` }]);
+      if (input.expiresOn <= new Date().toISOString().slice(0, 10)) throw new ValidationError([{ path: ['expiresOn'], message: `Your ${DOC_TITLES[key].toLowerCase()} has expired` }]);
+    }
     await this.db.tx(async (c) => {
       await c.query(
         `INSERT INTO rider_docs (rider_id, key, state, file_ref, expires_on, note) VALUES ($1,$2,'pending',$3,$4,'')
-         ON CONFLICT (rider_id, key) DO UPDATE SET state = 'pending', file_ref = $3, expires_on = $4, note = '', reviewed_by = NULL, reviewed_at = NULL, uploaded_at = now()`,
+         ON CONFLICT (rider_id, key) DO UPDATE SET valid_until = CASE WHEN rider_docs.state = 'valid' AND (rider_docs.expires_on IS NULL OR rider_docs.expires_on >= current_date) THEN COALESCE(rider_docs.expires_on, DATE '9999-12-31') WHEN rider_docs.state = 'pending' THEN rider_docs.valid_until END, state = 'pending', file_ref = $3, expires_on = $4, note = '', reviewed_by = NULL, reviewed_at = NULL, uploaded_at = now()`,
         [ctx.id, key, input.fileRef, input.expiresOn ?? null]);
       // A re-sent photo puts a rejected application back in the queue.
       await c.query(`UPDATE riders SET account_status = CASE WHEN account_status = 'rejected' THEN 'pending' ELSE account_status END, updated_at = now() WHERE id = $1`, [ctx.id]);
     });
     this.invalidate();
+    return this.account(ctx.id);
+  }
+
+  /** Language for messages, and which kinds of notification the rider wants. */
+  async setPrefs(ctx: RiderContext, input: z.infer<typeof PrefsSchema>) {
+    await this.db.tx(async (c) => {
+      if (input.language) await c.query('UPDATE riders SET language = $2, updated_at = now() WHERE id = $1', [ctx.id, input.language]);
+      if (input.notify) await c.query('UPDATE riders SET notify = notify || $2::jsonb, updated_at = now() WHERE id = $1', [ctx.id, JSON.stringify(input.notify)]);
+    });
+    return this.account(ctx.id);
+  }
+
+  /** What customers said about this rider. */
+  async ratings(ctx: RiderContext, limit: number) {
+    return this.db.read(async (c) => {
+      const sum = (await c.query<{ n: number; avg: string | null }>('SELECT count(*)::int AS n, avg(stars) AS avg FROM rider_ratings WHERE rider_id = $1', [ctx.id])).rows[0]!;
+      const recent = (await c.query<{ stars: number; comment: string; created_at: Date; order_no: number; customer: string | null }>(
+        `SELECT x.stars, x.comment, x.created_at, o.order_no, split_part(COALESCE(NULLIF(cu.name, ''), 'Customer'), ' ', 1) AS customer
+           FROM rider_ratings x JOIN deliveries d ON d.id = x.delivery_id JOIN orders o ON o.id = d.order_id LEFT JOIN customers cu ON cu.id = x.customer_id
+          WHERE x.rider_id = $1 ORDER BY x.created_at DESC LIMIT $2`, [ctx.id, limit])).rows;
+      let streak = 0;
+      for (const r of recent) { if (r.stars === 5) streak++; else break; }
+      return {
+        average: sum.avg ? Math.round(Number(sum.avg) * 100) / 100 : 0, count: sum.n, fiveStarStreak: streak,
+        items: recent.map((r) => ({ stars: r.stars, comment: r.comment, customer: r.customer ?? 'Customer', order: `SC-${r.order_no}`, at: r.created_at.toISOString() })),
+      };
+    });
+  }
+
+  /** The rider's invite code and the riders who joined with it. */
+  async referral(ctx: RiderContext) {
+    return this.db.read(async (c) => {
+      const p = await programme(c);
+      const me = (await c.query<{ referral_code: string }>('SELECT referral_code FROM riders WHERE id = $1', [ctx.id])).rows[0]!;
+      const items = (await c.query<{ id: string; name: string; deliveries_done: number; referral_paid_at: Date | null; account_status: string; created_at: Date }>(
+        'SELECT id, name, deliveries_done, referral_paid_at, account_status, created_at FROM riders WHERE referred_by = $1 ORDER BY created_at DESC LIMIT 100', [ctx.id])).rows;
+      return {
+        code: me.referral_code, rewardCents: p.referralRewardCents, goal: p.referralGoal,
+        earnedCents: items.filter((i) => i.referral_paid_at).length * p.referralRewardCents,
+        items: items.map((i) => ({ id: i.id, name: i.name, status: i.account_status, deliveries: i.deliveries_done, paid: !!i.referral_paid_at, joinedAt: i.created_at.toISOString() })),
+      };
+    });
+  }
+
+  /** Training lessons are help articles in the "Rider · Training" category; this adds which ones the rider has finished. */
+  async training(ctx: RiderContext) {
+    return this.db.read(async (c) => ({ items: (await c.query<{ id: string; title: string; excerpt: string; done: boolean }>(
+      `SELECT a.id, a.title, left(a.body, 160) AS excerpt, (d.rider_id IS NOT NULL) AS done FROM help_articles a LEFT JOIN rider_lessons_done d ON d.article_id = a.id AND d.rider_id = $1
+        WHERE a.live AND a.category = 'Rider · Training' ORDER BY a.created_at, a.title`, [ctx.id])).rows }));
+  }
+
+  async finishLesson(ctx: RiderContext, articleId: string) {
+    await this.db.tx(async (c) => {
+      const ok = (await c.query(`SELECT 1 FROM help_articles WHERE id = $1 AND live AND category = 'Rider · Training'`, [articleId])).rowCount;
+      if (!ok) throw new NotFoundError('Lesson');
+      await c.query('INSERT INTO rider_lessons_done (rider_id, article_id) VALUES ($1,$2) ON CONFLICT DO NOTHING', [ctx.id, articleId]);
+    });
+    return this.training(ctx);
+  }
+
+  /** Contact details the rider may change themselves. Name, phone and ID number go through support because they match the documents. */
+  async setDetails(ctx: RiderContext, input: z.infer<typeof RiderDetailsSchema>) {
+    await this.db.tx((c) => c.query('UPDATE riders SET email = $2, emergency_name = $3, emergency_relation = $4, emergency_phone = $5, updated_at = now() WHERE id = $1', [ctx.id, input.email, input.emergencyName, input.emergencyRelation, input.emergencyPhone]));
+    return this.account(ctx.id);
+  }
+
+  /** Changes where the rider is paid. The password is asked again so a borrowed phone can't redirect the money. */
+  async setPayout(ctx: RiderContext, input: z.infer<typeof PayoutDetailsSchema>) {
+    const row = (await this.db.read((c) => c.query<{ password_hash: string }>('SELECT password_hash FROM riders WHERE id = $1', [ctx.id]))).rows[0];
+    if (!row || !(await verifyPassword(input.password, row.password_hash))) throw new UnprocessableError('WRONG_PASSWORD', 'That password isn’t right');
+    await this.db.tx((c) => c.query('UPDATE riders SET payout_phone = $2, payout_name = $3, updated_at = now() WHERE id = $1', [ctx.id, input.payoutPhone, input.payoutName]));
     return this.account(ctx.id);
   }
 
@@ -277,7 +374,7 @@ export class RidersService {
     this.requireApproved(ctx);
     await this.db.tx(async (c) => {
       if (input.online) {
-        const bad = (await c.query<{ key: string }>(`SELECT key FROM rider_docs WHERE rider_id = $1 AND (state <> 'valid' OR (expires_on IS NOT NULL AND expires_on < current_date)) LIMIT 1`, [ctx.id])).rows[0];
+        const bad = (await c.query<{ key: string }>(`SELECT key FROM rider_docs WHERE rider_id = $1 AND NOT (state = 'valid' AND (expires_on IS NULL OR expires_on >= current_date)) AND NOT (state = 'pending' AND COALESCE(valid_until >= current_date, false)) LIMIT 1`, [ctx.id])).rows[0];
         if (bad) throw new UnprocessableError('DOCS_NOT_VALID', `Your ${DOC_TITLES[bad.key as keyof typeof DOC_TITLES].toLowerCase()} needs attention before you can go online`);
       }
       await c.query(`UPDATE riders SET availability = $2, last_lat = COALESCE($3, last_lat), last_lng = COALESCE($4, last_lng), last_seen_at = now(), updated_at = now() WHERE id = $1`,
@@ -314,7 +411,7 @@ export class RidersService {
         `SELECT d.id, o.order_no, d.status, d.delivered_at, d.created_at, d.fare_cents FROM deliveries d JOIN orders o ON o.id = d.order_id WHERE d.rider_id = $1 ORDER BY d.created_at DESC LIMIT 10`, [id])).rows;
       return {
         ...view(r),
-        documents: DOC_KEYS.map((k) => { const d = docs.find((x) => x.key === k); const expired = d?.expires_on && d.expires_on < new Date().toISOString().slice(0, 10);
+        documents: DOC_KEYS.filter((k) => docs.length === 0 || docs.some((x) => x.key === k)).map((k) => { const d = docs.find((x) => x.key === k); const expired = d?.expires_on && d.expires_on < new Date().toISOString().slice(0, 10);
           return { key: k, title: DOC_TITLES[k], state: expired && d?.state === 'valid' ? 'expired' : d?.state ?? 'pending', note: d?.note ?? '', fileRef: d?.file_ref ?? null, expiresOn: d?.expires_on ?? null, reviewedBy: d?.reviewed_by ?? null }; }),
         recentDeliveries: recent.map((d) => ({ id: d.id, order: `SC-${d.order_no}`, status: d.status, at: (d.delivered_at ?? d.created_at).toISOString(), fareCents: d.fare_cents })),
       };
@@ -324,9 +421,10 @@ export class RidersService {
   async reviewDoc(riderId: string, key: (typeof DOC_KEYS)[number], input: z.infer<typeof ReviewDocSchema>, actor: Actor) {
     await this.db.tx(async (c) => {
       const { rowCount } = await c.query(
-        `UPDATE rider_docs SET state = $3, note = $4, expires_on = COALESCE($5::date, expires_on), reviewed_by = $6, reviewed_at = now() WHERE rider_id = $1 AND key = $2`,
+        `UPDATE rider_docs SET state = $3, note = $4, valid_until = NULL, expires_on = COALESCE($5::date, expires_on), reviewed_by = $6, reviewed_at = now() WHERE rider_id = $1 AND key = $2`,
         [riderId, key, input.state, input.note, input.expiresOn ?? null, actor.name ?? 'Staff']);
       if (!rowCount) throw new NotFoundError('Document');
+      await queuePush(c, { type: 'rider', id: riderId }, input.state === 'valid' ? 'doc_accepted' : 'doc_rejected', { title: DOC_TITLES[key], note: input.note || 'send a clearer copy' });
       await audit(c, actor, 'rider.doc_review', 'rider', riderId, { key, ...input });
     });
     return this.get(riderId);
@@ -344,7 +442,7 @@ export class RidersService {
         await c.query(`UPDATE riders SET account_status = 'approved', reviewed_by = $2, reviewed_at = now(), review_note = '', rejected_doc = NULL, updated_at = now(), version = version + 1 WHERE id = $1`, [riderId, by]);
       } else if (input.action === 'reject') {
         if (r.account_status !== 'pending') throw new UnprocessableError('NOT_PENDING', 'This application isn’t waiting for review');
-        await c.query(`UPDATE rider_docs SET state = 'rejected', note = $3, reviewed_by = $4, reviewed_at = now() WHERE rider_id = $1 AND key = $2`, [riderId, input.docKey, input.note, by]);
+        await c.query(`UPDATE rider_docs SET state = 'rejected', valid_until = NULL, note = $3, reviewed_by = $4, reviewed_at = now() WHERE rider_id = $1 AND key = $2`, [riderId, input.docKey, input.note, by]);
         await c.query(`UPDATE riders SET account_status = 'rejected', reviewed_by = $2, reviewed_at = now(), review_note = $3, rejected_doc = $4, updated_at = now(), version = version + 1 WHERE id = $1`, [riderId, by, input.note, input.docKey]);
       } else if (input.action === 'suspend') {
         if (r.account_status === 'suspended') throw new UnprocessableError('ALREADY_SUSPENDED', 'This rider is already paused');
@@ -356,6 +454,9 @@ export class RidersService {
         if (r.account_status !== 'suspended') throw new UnprocessableError('NOT_SUSPENDED', 'This rider isn’t paused');
         await c.query(`UPDATE riders SET account_status = 'approved', review_note = '', reviewed_by = $2, reviewed_at = now(), updated_at = now(), version = version + 1 WHERE id = $1`, [riderId, by]);
       }
+      if (input.action === 'approve') await queuePush(c, { type: 'rider', id: riderId }, 'approved');
+      else if (input.action === 'suspend') await queuePush(c, { type: 'rider', id: riderId }, 'suspended', { reason: input.reason });
+      else if (input.action === 'reinstate') await queuePush(c, { type: 'rider', id: riderId }, 'reinstated');
       await audit(c, actor, `rider.${input.action}`, 'rider', riderId, input);
     });
     this.invalidate();

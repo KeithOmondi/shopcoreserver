@@ -3,28 +3,34 @@ import { z } from 'zod';
 import { ForbiddenError, ValidationError } from '../domain/errors.js';
 import type { RiderContext, RidersService } from '../modules/dispatch/riders.js';
 import {
-  AvailabilitySchema, CodeRequestSchema, CodeVerifySchema, DOC_KEYS, PingSchema, RegisterSchema, ReviewDocSchema, RiderActionSchema, RiderListSchema, RiderLoginSchema,
+  AvailabilitySchema, PayoutDetailsSchema, RiderDetailsSchema, CodeRequestSchema, CodeVerifySchema, DOC_KEYS, PingSchema, RegisterSchema, ReviewDocSchema, RiderActionSchema, RiderListSchema, RiderLoginSchema,
   RiderPatchSchema, RiderRefreshSchema, RiderResetSchema, ShiftQuerySchema, ShiftSchema, SubmitDocSchema,
 } from '../modules/dispatch/riders.js';
 import {
   AssignSchema, DeclineSchema, DeliverSchema, ExceptionListSchema, FailSchema, IncidentListSchema, IncidentSchema, IncidentUpdateSchema, ResolveSchema, StageSchema, type DispatchService,
 } from '../modules/dispatch/dispatch.js';
 import { AdjustSchema, DepositSchema, PayoutFailSchema, PayoutListSchema, PayoutPaySchema, WithdrawSchema, type RiderMoneyService } from '../modules/dispatch/money.js';
-import { DeliverySettingsSchema, ZoneIdParam, ZonePatchSchema, ZoneSchema, type ZonesService } from '../modules/dispatch/zones.js';
+import { AppStatusSchema, BusinessProfileSchema, DeliverySettingsSchema, ZoneIdParam, ZonePatchSchema, ZoneSchema, type ZonesService } from '../modules/dispatch/zones.js';
 import type { CustomersService } from '../modules/orders/admin-orders.js';
 import { requirePrincipal, requireRole } from './auth.js';
 import { makeGuard } from './guard.js';
 import type { Authz } from './staff-routes.js';
 import { IdParam, parse } from './validate.js';
 
-export interface FieldServices { zones: ZonesService; riders: RidersService; dispatch: DispatchService; riderMoney: RiderMoneyService; customers: CustomersService }
+export interface FieldServices { zones: ZonesService; riders: RidersService; push: PushService; dispatch: DispatchService; riderMoney: RiderMoneyService; customers: CustomersService; rewards: RewardsService }
 
 const DocParam = z.object({ id: z.string(), key: z.enum(DOC_KEYS) });
 const ShiftDelete = z.object({ riderId: z.string().uuid(), day: z.string().regex(/^\d{4}-\d{2}-\d{2}$/) });
 
 /** Everything about riders and delivery: the rider app’s API, and the dispatch, rider and money screens for staff. */
+import { PushTokenSchema, type PushService } from '../modules/integrations/push.js';
+import { RewardsSchema, type RewardsService } from '../modules/customers/rewards.js';
+import { ProgrammeSchema } from '../modules/dispatch/money.js';
+import { PrefsSchema, RatingPageSchema } from '../modules/dispatch/riders.js';
+import { RiderRatingSchema } from '../modules/dispatch/dispatch.js';
+
 export function registerFieldRoutes(app: FastifyInstance, svc: FieldServices, authz: Authz) {
-  const { zones, riders, dispatch, riderMoney } = svc;
+  const { zones, riders, push, dispatch, riderMoney, rewards } = svc;
   const { guard, NoStore } = makeGuard(authz);
   const device = (req: FastifyRequest) => String(req.headers['user-agent'] ?? '');
 
@@ -50,9 +56,19 @@ export function registerFieldRoutes(app: FastifyInstance, svc: FieldServices, au
   app.get('/v1/rider/me', async (req, reply) => { NoStore(reply); return riders.account((await anyRider(req)).id); });
   app.post('/v1/rider/me/welcome', async (req) => riders.welcome(await anyRider(req)));
   app.put('/v1/rider/me/documents/:key', async (req) => riders.submitDoc(await anyRider(req), parse(z.object({ key: z.enum(DOC_KEYS) }), req.params).key, parse(SubmitDocSchema, req.body)));
+  app.put('/v1/rider/me/preferences', async (req) => riders.setPrefs(await anyRider(req), parse(PrefsSchema, req.body)));
+  app.post('/v1/rider/push-token', async (req, reply) => { const me = await anyRider(req); const b = parse(PushTokenSchema, req.body); await push.register({ type: 'rider', id: me.id }, b.token, b.platform); return reply.status(204).send(); });
+  app.delete('/v1/rider/push-token', async (req, reply) => { const me = await anyRider(req); await push.unregister({ type: 'rider', id: me.id }, parse(PushTokenSchema.pick({ token: true }), req.body).token); return reply.status(204).send(); });
+  app.get('/v1/rider/ratings', async (req, reply) => { NoStore(reply); return riders.ratings(await rider(req), parse(RatingPageSchema, req.query).limit); });
+  app.get('/v1/rider/referral', async (req, reply) => { NoStore(reply); return riders.referral(await anyRider(req)); });
+  app.get('/v1/rider/training', async (req, reply) => { NoStore(reply); return riders.training(await anyRider(req)); });
+  app.post('/v1/rider/training/:id/done', async (req) => riders.finishLesson(await anyRider(req), parse(IdParam, req.params).id));
+  app.put('/v1/rider/me/details', async (req) => riders.setDetails(await anyRider(req), parse(RiderDetailsSchema, req.body)));
+  app.put('/v1/rider/me/payout', async (req) => riders.setPayout(await anyRider(req), parse(PayoutDetailsSchema, req.body)));
   app.put('/v1/rider/availability', async (req) => riders.setAvailability(await anyRider(req), parse(AvailabilitySchema, req.body)));
   app.post('/v1/rider/location', async (req, reply) => { await riders.ping(await rider(req), parse(PingSchema, req.body)); return reply.status(204).send(); });
 
+  app.get('/v1/rider/shifts', async (req, reply) => { NoStore(reply); const me = await anyRider(req); const from = new Date().toISOString().slice(0, 10); const to = new Date(Date.now() + 14 * 86_400_000).toISOString().slice(0, 10); return riders.shifts({ from, to, riderId: me.id }); });
   app.get('/v1/rider/offers', async (req, reply) => { NoStore(reply); return dispatch.offers(await rider(req)); });
   app.post('/v1/rider/offers/:id/accept', async (req) => dispatch.accept(await rider(req), parse(IdParam, req.params).id));
   app.post('/v1/rider/offers/:id/decline', async (req, reply) => { await dispatch.decline(await rider(req), parse(IdParam, req.params).id, parse(DeclineSchema, req.body ?? {}).reason); return reply.status(204).send(); });
@@ -60,7 +76,7 @@ export function registerFieldRoutes(app: FastifyInstance, svc: FieldServices, au
   app.post('/v1/rider/deliveries/:id/stage', async (req) => dispatch.stage(await rider(req), parse(IdParam, req.params).id, parse(StageSchema, req.body).stage));
   app.post('/v1/rider/deliveries/:id/deliver', async (req) => dispatch.deliver(await rider(req), parse(IdParam, req.params).id, parse(DeliverSchema, req.body)));
   app.post('/v1/rider/deliveries/:id/fail', async (req, reply) => { await dispatch.fail(await rider(req), parse(IdParam, req.params).id, parse(FailSchema, req.body)); return reply.status(204).send(); });
-  app.get('/v1/rider/history', async (req, reply) => { NoStore(reply); return dispatch.history_(await rider(req)); });
+  app.get('/v1/rider/history', async (req, reply) => { NoStore(reply); return dispatch.history_(await rider(req), parse(z.object({ before: z.string().datetime().optional() }), req.query).before); });
   app.get('/v1/rider/earnings', async (req, reply) => { NoStore(reply); return riderMoney.mine(await anyRider(req)); });
   app.post('/v1/rider/withdrawals', async (req, reply) => reply.status(201).send(await riderMoney.withdraw(await rider(req), parse(WithdrawSchema, req.body).amountCents)));
   app.post('/v1/rider/incidents', async (req, reply) => reply.status(201).send(await dispatch.report(await rider(req), parse(IncidentSchema, req.body))));
@@ -71,15 +87,28 @@ export function registerFieldRoutes(app: FastifyInstance, svc: FieldServices, au
     return dispatch.forCustomer(requireRole(req, 'customer').sub, parse(IdParam, req.params).id);
   });
 
+  app.post('/v1/orders/:id/rider-rating', async (req) => dispatch.rateRider(requireRole(req, 'customer').sub, parse(IdParam, req.params).id, parse(RiderRatingSchema, req.body)));
+
   // ================= delivery zones and fees =================================================================
   app.get('/v1/admin/zones', (req, reply) => guard(req, [['Settings', 'View'], ['Dispatch', 'View'], ['Riders', 'View']], async () => { NoStore(reply); return zones.list(); }));
   app.post('/v1/admin/zones', (req, reply) => guard(req, [['Settings', 'Edit']], async (a) => reply.status(201).send(await zones.create(parse(ZoneSchema, req.body), a))));
   app.patch('/v1/admin/zones/:id', (req) => guard(req, [['Settings', 'Edit']], (a) => zones.update(parse(ZoneIdParam, req.params).id, parse(ZonePatchSchema, req.body), a)));
   app.delete('/v1/admin/zones/:id', (req, reply) => guard(req, [['Settings', 'Edit']], async (a) => { await zones.remove(parse(ZoneIdParam, req.params).id, a); return reply.status(204).send(); }));
+  // The apps ask at launch whether the shop is closed for maintenance or the app is too old.
+  app.get('/v1/app/status', async (_req, reply) => { reply.header('cache-control', 'no-store'); return zones.appStatus(); });
+  app.get('/v1/admin/business-profile', (req) => guard(req, [['Settings', 'View']], () => zones.businessProfile()));
+  app.put('/v1/admin/business-profile', (req) => guard(req, [['Settings', 'Edit']], (a) => zones.saveBusinessProfile(parse(BusinessProfileSchema, req.body), a)));
+  app.get('/v1/admin/app-status', (req) => guard(req, [['Settings', 'View']], () => zones.appStatus()));
+  app.put('/v1/admin/app-status', (req) => guard(req, [['Settings', 'Edit']], (a) => zones.saveAppStatus(parse(AppStatusSchema, req.body), a)));
+  app.get('/v1/admin/rider-programme', (req) => guard(req, [['Settings', 'View'], ['Riders', 'View']], () => riderMoney.programme()));
+  app.get('/v1/admin/rewards-programme', (req) => guard(req, [['Settings', 'View'], ['Customers', 'View']], () => rewards.programme()));
+  app.put('/v1/admin/rewards-programme', (req) => guard(req, [['Settings', 'Edit']], (a) => rewards.saveProgramme(parse(RewardsSchema, req.body), a)));
+  app.put('/v1/admin/rider-programme', (req) => guard(req, [['Settings', 'Edit']], (a) => riderMoney.saveProgramme(parse(ProgrammeSchema, req.body), a)));
   app.put('/v1/admin/delivery-settings', (req) => guard(req, [['Settings', 'Edit']], (a) => zones.saveSettings(parse(DeliverySettingsSchema, req.body), a)));
 
   // ================= riders ======================================================================================
   app.get('/v1/admin/riders', (req, reply) => guard(req, [['Riders', 'View'], ['Dispatch', 'View']], async () => { NoStore(reply); return riders.list(parse(RiderListSchema, req.query)); }));
+  app.get('/v1/admin/riders/:id/ratings', (req, reply) => guard(req, [['Riders', 'View']], async () => { NoStore(reply); return riders.ratings({ id: parse(IdParam, req.params).id } as never, parse(RatingPageSchema, req.query).limit); }));
   app.get('/v1/admin/riders/:id', (req, reply) => guard(req, [['Riders', 'View'], ['Dispatch', 'View']], async () => { NoStore(reply); return riders.get(parse(IdParam, req.params).id); }));
   app.patch('/v1/admin/riders/:id', (req) => guard(req, [['Riders', 'Edit']], (a) => riders.update(parse(IdParam, req.params).id, parse(RiderPatchSchema, req.body), a)));
   app.post('/v1/admin/riders/:id/actions', (req) => guard(req, [['Riders', 'Edit']], (a) => riders.act(parse(IdParam, req.params).id, parse(RiderActionSchema, req.body), a)));

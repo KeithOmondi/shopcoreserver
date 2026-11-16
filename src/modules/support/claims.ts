@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { queuePush } from '../integrations/push.js';
 import type { Database, Queryable } from '../../infra/db.js';
 import { ConflictError, ForbiddenError, NotFoundError, UnprocessableError, ValidationError } from '../../domain/errors.js';
 import { isUuid, uuidv7 } from '../../infra/uuid.js';
@@ -23,7 +24,7 @@ export const RefundDecisionSchema = z.discriminatedUnion('decision', [
 export const NoteSchema = z.strictObject({ text: z.string().trim().min(1).max(1000) });
 
 export const ReturnListSchema = z.object({ status: z.enum(['new', 'review', 'pending', 'evidence_requested', 'approved', 'rejected']).optional(), open: flag.optional(), limit: z.coerce.number().int().min(1).max(200).default(50) });
-export const OwnReturnSchema = z.strictObject({ productId: uuid, qty: z.number().int().min(1).max(100).default(1), reason: z.string().trim().min(3).max(200), statement: z.string().trim().max(2000).default(''), photos: z.number().int().min(0).max(10).default(0) });
+export const OwnReturnSchema = z.strictObject({ productId: uuid, qty: z.number().int().min(1).max(100).default(1), reason: z.string().trim().min(3).max(200), statement: z.string().trim().max(2000).default(''), photos: z.number().int().min(0).max(10).default(0), photoIds: z.array(uuid).max(5).default([]) });
 export const ReturnDecisionSchema = z.strictObject({ decision: z.enum(['approved', 'rejected', 'evidence_requested', 'review']), note: z.string().trim().min(3).max(500), inspection: z.enum(['confirmed', 'more']).default('confirmed') });
 
 export const DisputeListSchema = z.object({ status: z.enum(['awaiting_decision', 'escalated', 'resolved_customer', 'resolved_rider']).optional(), open: flag.optional(), limit: z.coerce.number().int().min(1).max(200).default(50) });
@@ -165,8 +166,13 @@ export class ClaimsService {
       if (!it) throw new ValidationError([{ path: ['productId'], message: 'That item wasn’t on this order' }]);
       const already = Number((await c.query<{ n: number }>(`SELECT COALESCE(sum(qty),0)::int AS n FROM return_requests WHERE order_id = $1 AND product_id = $2 AND status <> 'rejected'`, [orderId, input.productId])).rows[0]!.n);
       if (already + input.qty > it.quantity) throw new UnprocessableError('ALREADY_RETURNED', 'You’ve already asked to return that item');
-      await c.query(`INSERT INTO return_requests (id, order_id, customer_id, customer_name, product_id, item, item_value_cents, qty, reason, statement, photos) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
-        [id, orderId, person.id, o.name, input.productId, it.name, it.unit_price_cents * input.qty, input.qty, input.reason, input.statement, input.photos]);
+      const photoIds = [...new Set(input.photoIds)];
+      if (photoIds.length) {
+        const mine = (await c.query(`SELECT 1 FROM uploads WHERE id = ANY($1::uuid[]) AND kind = 'return-photo' AND owner_id = $2`, [photoIds, person.id])).rowCount;
+        if (mine !== photoIds.length) throw new ValidationError([{ path: ['photoIds'], message: 'one of those photos wasn’t uploaded by you' }]);
+      }
+      await c.query(`INSERT INTO return_requests (id, order_id, customer_id, customer_name, product_id, item, item_value_cents, qty, reason, statement, photos, photo_ids) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+        [id, orderId, person.id, o.name, input.productId, it.name, it.unit_price_cents * input.qty, input.qty, input.reason, input.statement, photoIds.length || input.photos, photoIds]);
     });
     return { id };
   }
@@ -179,6 +185,11 @@ export class ClaimsService {
       if (['approved', 'rejected'].includes(r.status)) throw new ConflictError('ALREADY_DECIDED', 'This return has already been decided');
       const final = input.decision === 'approved' || input.decision === 'rejected';
       await c.query('UPDATE return_requests SET status = $2, note = $3, inspection = $4, decided_by = CASE WHEN $5 THEN $6 END, decided_at = CASE WHEN $5 THEN now() END WHERE id = $1', [id, input.decision, input.note, input.inspection, final, actor.name]);
+      {
+        const cust = (await c.query<{ customer_id: string }>('SELECT customer_id FROM return_requests WHERE id = $1', [id])).rows[0];
+        const msg = input.decision === 'approved' ? `Return RR-${r.request_no} was approved.` : input.decision === 'rejected' ? `Return RR-${r.request_no} couldn’t be approved.${input.note ? ` ${input.note}` : ''}` : `We need more information for return RR-${r.request_no}.`;
+        if (cust?.customer_id) await queuePush(c, { type: 'customer', id: cust.customer_id }, 'return_update', { message: msg }, { orderId: r.order_id, screen: 'order' });
+      }
       if (input.decision === 'approved') {
         // The item now waits in the warehouse queue for a restock / write-off decision.
         await c.query(
@@ -289,11 +300,11 @@ const refundView = (r: RefundRow) => ({
   decision: r.decided_at ? { by: r.decided_by_name, at: r.decided_at.toISOString(), amountCents: r.decided_cents ?? 0, reason: r.decision_reason ?? '' } : null,
 });
 
-interface ReturnRow { id: string; request_no: number; order_id: string; order_no: number; customer_name: string; item: string; item_value_cents: number; qty: number; reason: string; statement: string; photos: number; status: string; inspection: string; note: string; ticket_id: string | null; submitted_at: Date; decided_by: string | null; decided_at: Date | null }
+interface ReturnRow { id: string; request_no: number; order_id: string; order_no: number; customer_name: string; item: string; item_value_cents: number; qty: number; reason: string; statement: string; photos: number; photo_ids: string[]; status: string; inspection: string; note: string; ticket_id: string | null; submitted_at: Date; decided_by: string | null; decided_at: Date | null }
 const RETURN_SELECT = `SELECT r.*, o.order_no FROM return_requests r JOIN orders o ON o.id = r.order_id`;
 const returnView = (r: ReturnRow) => ({
   id: r.id, number: `RR-${r.request_no}`, orderId: r.order_id, order: `SC-${r.order_no}`, customer: r.customer_name, item: r.item, itemValueCents: r.item_value_cents, qty: r.qty, reason: r.reason, statement: r.statement,
-  photos: r.photos, status: r.status, inspection: r.inspection, note: r.note, ticketId: r.ticket_id, submittedAt: r.submitted_at.toISOString(), decidedBy: r.decided_by, decidedAt: r.decided_at?.toISOString() ?? null,
+  photos: r.photos, photoUrls: (r.photo_ids ?? []).map((p) => `/v1/files/${p}`), status: r.status, inspection: r.inspection, note: r.note, ticketId: r.ticket_id, submittedAt: r.submitted_at.toISOString(), decidedBy: r.decided_by, decidedAt: r.decided_at?.toISOString() ?? null,
 });
 
 interface DisputeRow { id: string; dispute_no: number; order_id: string; order_no: number; customer_id: string; customer_name: string; rider_id: string | null; rider_name: string; claim_by: string; category: string; priority: string; status: string; customer_statement: string; rider_statement: string; evidence: unknown; notes: string; ticket_id: string | null; assignee_name: string | null; opened_at: Date; sla_due_at: Date; outcome_by: string | null; outcome_at: Date | null; outcome_note: string | null }

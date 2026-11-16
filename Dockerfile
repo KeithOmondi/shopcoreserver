@@ -25,4 +25,5 @@ EXPOSE 8080 9464
 # The distroless entrypoint is `node`. Tracing bootstrap loads first so auto-instrumentation can patch modules.
 # Override CMD for the worker:   ["--require", "./dist/src/infra/tracing.js", "dist/src/worker.js"]
 # and for migrations:           ["dist/scripts/migrate.js"]
-CMD ["--require", "./dist/src/infra/tracing.js", "dist/src/server.js"]
+# SERVICE_ROLE=worker runs the background worker from this same image; otherwise the API starts.
+CMD ["--require", "./dist/src/infra/tracing.js", "dist/src/main.js"]

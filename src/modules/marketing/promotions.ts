@@ -4,7 +4,7 @@ import { ConflictError, NotFoundError, UnprocessableError } from '../../domain/e
 import { uuidv7 } from '../../infra/uuid.js';
 import { audit, type Actor } from '../products/products.js';
 import { patchOf } from '../../http/validate.js';
-import { feeFor } from '../dispatch/zones.js';
+import { deliverySettings, feeFor } from '../dispatch/zones.js';
 import { inSegment } from './audience.js';
 
 const uuid = z.string().uuid();
@@ -285,18 +285,44 @@ export class PromotionsService {
   }
 
   /** What a shopper's basket would cost with an optional coupon, exactly as checkout would charge it. */
+  /**
+   * What a basket would cost, exactly as checkout will charge it, and whether it can be ordered right now.
+   * Problems with the basket (an item gone, not enough stock, below the minimum, an area we don't serve) come back as `issues`
+   * rather than errors, so the app can show them against the right line. A coupon that can't be used is still a 422 COUPON_INVALID.
+   */
   async quote(userId: string, input: z.infer<typeof QuoteSchema>) {
     return this.db.read(async (c) => {
       const ids = input.items.map((i) => i.productId);
-      const prods = (await c.query<{ id: string; price_cents: number; category_id: string | null; active: boolean }>('SELECT id, price_cents, category_id, active FROM products WHERE id = ANY($1::uuid[])', [ids])).rows;
+      const prods = (await c.query<{ id: string; name: string; price_cents: number; category_id: string | null; active: boolean; status: string; available: number | null; track_stock: boolean }>(
+        'SELECT p.id, p.name, p.price_cents, p.category_id, p.active, p.status, i.available, p.track_stock FROM products p LEFT JOIN inventory i ON i.product_id = p.id WHERE p.id = ANY($1::uuid[])', [ids])).rows;
       const byId = new Map(prods.map((p) => [p.id, p]));
-      const missing = ids.filter((i) => !byId.get(i)?.active);
-      if (missing.length) throw new UnprocessableError('PRODUCT_UNAVAILABLE', 'Some products are unavailable', { productIds: missing });
-      const fee = input.area ? (await feeFor(c, input.area)).feeCents : 0;
-      const p = await priceBasket(c, userId, input.items.map((i) => ({ productId: i.productId, priceCents: Number(byId.get(i.productId)!.price_cents), categoryId: byId.get(i.productId)!.category_id, quantity: i.quantity })), fee, input.couponCode, false);
+      const issues: { code: string; message: string; productId?: string; available?: number }[] = [];
+      const buyable = input.items.filter((i) => {
+        const p = byId.get(i.productId);
+        const ok = !!p && p.active && p.status === 'active';
+        if (!ok) issues.push({ code: 'PRODUCT_UNAVAILABLE', message: `${p?.name ?? 'An item'} isn’t available any more`, productId: i.productId });
+        return ok;
+      });
+      for (const i of buyable) {
+        const p = byId.get(i.productId)!;
+        const have = Math.max(0, p.available ?? 0);
+        if (i.quantity > have) issues.push({ code: have === 0 ? 'OUT_OF_STOCK' : 'INSUFFICIENT_STOCK', message: have === 0 ? `${p.name} is out of stock` : `Only ${have} of ${p.name} left`, productId: i.productId, available: have });
+      }
+      let fee = 0;
+      if (input.area) {
+        const f = await feeFor(c, input.area);
+        fee = f.feeCents;
+        if (f.zoneId === null) issues.push({ code: 'AREA_NOT_SERVED', message: 'We don’t deliver to that area yet' });
+      }
+      const p = await priceBasket(c, userId, buyable.map((i) => ({ productId: i.productId, priceCents: Number(byId.get(i.productId)!.price_cents), categoryId: byId.get(i.productId)!.category_id, quantity: i.quantity })), fee, input.couponCode, false);
+      const min = input.area ? (await deliverySettings(c)).minBasketCents : 0;
+      const listSubtotal = buyable.reduce((n, i) => n + Number(byId.get(i.productId)!.price_cents) * i.quantity, 0);
+      if (min > 0 && listSubtotal < min) issues.push({ code: 'BELOW_MINIMUM_BASKET', message: `The minimum order for delivery is KES ${(min / 100).toLocaleString('en-KE')}` });
       return {
-        lines: p.lines.map((l) => ({ productId: l.productId, quantity: l.quantity, listCents: l.priceCents, unitCents: l.unitCents, onSale: !!l.flashSaleId })),
-        subtotalCents: p.subtotalCents, deliveryFeeCents: fee, bundle: p.bundle, coupon: p.coupon, discountCents: p.discountCents, totalCents: p.subtotalCents + fee - p.discountCents,
+        lines: p.lines.map((l) => ({ productId: l.productId, quantity: l.quantity, listCents: l.priceCents, unitCents: l.unitCents, onSale: !!l.flashSaleId, available: Math.max(0, byId.get(l.productId)!.available ?? 0) })),
+        unavailable: input.items.filter((i) => !buyable.includes(i)).map((i) => i.productId),
+        subtotalCents: p.subtotalCents, deliveryFeeCents: fee, bundle: p.bundle, coupon: p.coupon, discountCents: p.discountCents, totalCents: Math.max(0, p.subtotalCents + fee - p.discountCents),
+        minBasketCents: min, issues, canOrder: issues.length === 0 && buyable.length > 0 && !!input.area,
       };
     });
   }

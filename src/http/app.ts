@@ -21,6 +21,9 @@ import { registerMarketingRoutes } from './marketing-routes.js';
 import { registerIntegrationRoutes } from './integration-routes.js';
 import { registerCustomerRoutes } from './customer-routes.js';
 import type { CustomerAuthService } from '../modules/customers/auth.js';
+import type { CustomerAccountService } from '../modules/customers/account.js';
+import type { CustomerEngagementService } from '../modules/customers/engagement.js';
+import type { CustomerOrdersService } from '../modules/orders/customer-orders.js';
 import type { MpesaService } from '../modules/integrations/mpesa.js';
 import type { UploadService } from '../modules/integrations/storage.js';
 import type { AudienceService } from '../modules/marketing/audience.js';
@@ -36,6 +39,8 @@ import type { SupportService } from '../modules/support/support.js';
 import type { ClaimsService } from '../modules/support/claims.js';
 import type { ZonesService } from '../modules/dispatch/zones.js';
 import type { RidersService } from '../modules/dispatch/riders.js';
+import type { RewardsService } from '../modules/customers/rewards.js';
+import type { PushService } from '../modules/integrations/push.js';
 import type { DispatchService } from '../modules/dispatch/dispatch.js';
 import type { RiderMoneyService } from '../modules/dispatch/money.js';
 import type { AdminOrdersService, CustomersService } from '../modules/orders/admin-orders.js';
@@ -69,6 +74,7 @@ export interface AppDeps {
   customers: CustomersService;
   zones: ZonesService;
   riders: RidersService;
+  push: PushService;
   dispatch: DispatchService;
   riderMoney: RiderMoneyService;
   support: SupportService;
@@ -79,6 +85,10 @@ export interface AppDeps {
   reports: ReportsService;
   mpesa: MpesaService;
   customerAuth: CustomerAuthService;
+  customerAccount: CustomerAccountService;
+  customerOrders: CustomerOrdersService;
+  customerEngagement: CustomerEngagementService;
+  rewards: RewardsService;
   uploads: UploadService;
   audience: AudienceService;
   promotions: PromotionsService;
@@ -250,10 +260,26 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
 
   const actorOf = (req: FastifyRequest) => ({ id: requirePrincipal(req).sub, requestId: String(req.id) });
   const authz = makeAuthz(deps.staff);
+  // What is connected and whether the dependencies answer, for the admin's Integrations and Health pages. No secrets are returned.
+  app.get('/v1/admin/system/status', async (req, reply) => {
+    await authz.authorize(req, 'Settings', 'View');
+    reply.header('cache-control', 'no-store');
+    const started = Date.now();
+    const health = await deps.health.deps().catch(() => ({ error: 'unreachable' }) as Record<string, string>);
+    return {
+      environment: cfg.NODE_ENV, checkedAt: new Date().toISOString(), responseMs: Date.now() - started, uptimeS: Math.round(process.uptime()), health,
+      integrations: {
+        mpesa: { mode: cfg.MPESA_ENV, connected: cfg.MPESA_ENV === 'sandbox' || cfg.MPESA_ENV === 'production' },
+        sms: { provider: cfg.SMS_PROVIDER, connected: cfg.SMS_PROVIDER === 'africastalking' },
+        files: { driver: 'server disk', connected: true },
+        payouts: { connected: false }, push: { connected: false }, email: { connected: false },
+      },
+    };
+  });
   registerStaffRoutes(app, deps.staff, authz, { secure: cfg.NODE_ENV === 'production', maxAgeS: cfg.STAFF_SESSION_TTL_S });
-  registerFieldRoutes(app, { zones: deps.zones, riders: deps.riders, dispatch: deps.dispatch, riderMoney: deps.riderMoney, customers: deps.customers }, authz);
+  registerFieldRoutes(app, { rewards: deps.rewards, zones: deps.zones, riders: deps.riders, push: deps.push, dispatch: deps.dispatch, riderMoney: deps.riderMoney, customers: deps.customers }, authz);
   registerSupportRoutes(app, { support: deps.support, claims: deps.claims, riders: deps.riders }, authz);
-  registerCustomerRoutes(app, deps.customerAuth);
+  registerCustomerRoutes(app, deps.customerAuth, deps.customerAccount, deps.customerOrders, deps.customerEngagement, deps.push, deps.rewards);
   registerIntegrationRoutes(app, { mpesa: deps.mpesa, uploads: deps.uploads }, authz, cfg);
   registerMarketingRoutes(app, { audience: deps.audience, promotions: deps.promotions, engage: deps.engage, content: deps.content, storefront: deps.storefront }, authz);
   registerFinanceRoutes(app, { payments: deps.paymentsAdmin, cash: deps.cash, billing: deps.billing, payroll: deps.payroll, reports: deps.reports }, authz);

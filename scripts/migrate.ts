@@ -14,8 +14,8 @@ import pg from 'pg';
 
 const LOCK_ID = 727274001;
 
-export async function migrate(databaseUrl: string, dir: string, log = console.log): Promise<string[]> {
-  const client = new pg.Client({ connectionString: databaseUrl, application_name: 'shopcore-migrate' });
+export async function migrate(databaseUrl: string, dir: string, log = console.log, ssl?: pg.ClientConfig['ssl']): Promise<string[]> {
+  const client = new pg.Client({ connectionString: databaseUrl, application_name: 'shopcore-migrate', ssl });
   await client.connect();
   const applied: string[] = [];
   try {

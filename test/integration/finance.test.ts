@@ -41,10 +41,10 @@ const fail = async (orderId: string, reason: string, ref: string) => {
 async function newRider(phone: string, name: string) {
   expect((await call('POST', '/v1/rider/auth/code', null, { phone, purpose: 'signup' })).statusCode).toBe(204);
   expect((await call('POST', '/v1/rider/auth/verify', null, { phone, purpose: 'signup', code: '123456' })).statusCode).toBe(204);
-  const reg = await call('POST', '/v1/rider/auth/register', null, { phone, password: 'Ride1234', name, vehicle: 'Motorbike', plate: 'KDA 284G', zoneId: zone });
+  const reg = await call('POST', '/v1/rider/auth/register', null, { phone, password: 'Ride1234', kraPin: 'A123456789B', emergencyName: 'Next Kin', emergencyRelation: 'Sibling', emergencyPhone: '+254700000000', name, vehicle: 'Motorbike', plate: 'KDA 284G', zoneId: zone });
   expect(reg.statusCode).toBe(201);
   const t = reg.json() as { accessToken: string; account: { id: string } };
-  for (const key of ['id', 'license', 'insurance', 'photo', 'selfie']) await call('PUT', `/v1/admin/riders/${t.account.id}/documents/${key}`, james, { state: 'valid' });
+  for (const key of ['id', 'license', 'insurance', 'logbook', 'photo', 'selfie', 'kra', 'conduct']) await call('PUT', `/v1/admin/riders/${t.account.id}/documents/${key}`, james, { state: 'valid' });
   expect((await call('POST', `/v1/admin/riders/${t.account.id}/actions`, james, { action: 'approve' })).statusCode).toBe(200);
   await new Promise((r) => setTimeout(r, 0));
   h.c.riders.invalidate();

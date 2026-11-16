@@ -56,6 +56,13 @@ export interface Order {
   createdAt: string;
   updatedAt: string;
   items: OrderItem[];
+  /** What the shopper was charged, broken down. The total is subtotal + delivery fee - discount. */
+  subtotalCents: number;
+  deliveryFeeCents: number;
+  discountCents: number;
+  paymentMethod: 'mpesa' | 'card' | 'cod' | null;
+  paidAt: string | null;
+  delivery: { name: string; phone: string; area: string; address: string } | null;
 }
 
 export const makeCreateOrderSchema = (cfg: Pick<Config, 'ORDER_MAX_LINES' | 'ORDER_MAX_QTY_PER_LINE'>) =>
@@ -112,6 +119,15 @@ interface OrderRow {
   version: number;
   created_at: Date;
   updated_at: Date;
+  subtotal_cents: number | null;
+  delivery_fee_cents: number;
+  discount_cents: number;
+  payment_method: 'mpesa' | 'card' | 'cod' | null;
+  paid_at: Date | null;
+  delivery_name: string | null;
+  delivery_phone: string | null;
+  delivery_area: string | null;
+  delivery_address: string | null;
 }
 interface ItemRow {
   line_no: number;
@@ -122,7 +138,7 @@ interface ItemRow {
   unit_price_cents: number;
 }
 
-const ORDER_COLS = 'id, order_no, user_id, status, total_cents, currency, item_count, version, created_at, updated_at';
+const ORDER_COLS = 'id, order_no, user_id, status, total_cents, currency, item_count, version, created_at, updated_at, subtotal_cents, delivery_fee_cents, discount_cents, payment_method, paid_at, delivery_name, delivery_phone, delivery_area, delivery_address';
 
 const toOrder = (o: OrderRow, items: ItemRow[]): Order => ({
   id: o.id,
@@ -135,6 +151,12 @@ const toOrder = (o: OrderRow, items: ItemRow[]): Order => ({
   version: o.version,
   createdAt: o.created_at.toISOString(),
   updatedAt: o.updated_at.toISOString(),
+  subtotalCents: Number(o.subtotal_cents ?? o.total_cents),
+  deliveryFeeCents: Number(o.delivery_fee_cents),
+  discountCents: Number(o.discount_cents),
+  paymentMethod: o.payment_method,
+  paidAt: o.paid_at?.toISOString() ?? null,
+  delivery: o.delivery_address ? { name: o.delivery_name ?? '', phone: o.delivery_phone ?? '', area: o.delivery_area ?? '', address: o.delivery_address } : null,
   items: items.map((i) => ({
     lineNo: i.line_no,
     productId: i.product_id,
@@ -264,7 +286,7 @@ export class OrderService {
           currency: string;
           active: boolean;
           category_id: string | null;
-        }>('SELECT id, sku, name, price_cents, currency, active, category_id FROM products WHERE id = ANY($1::uuid[])', [ids]);
+        }>(`SELECT id, sku, name || COALESCE(' - ' || (SELECT string_agg(p.options ->> a.key, ' / ' ORDER BY a.position) FROM category_attributes a WHERE a.category_id = p.category_id AND a.is_option AND p.options ? a.key), '') AS name, price_cents, currency, active, category_id FROM products p WHERE id = ANY($1::uuid[])`, [ids]);
         const byId = new Map(products.rows.map((p) => [p.id, p]));
         const missing = ids.filter((id) => !byId.get(id)?.active);
         if (missing.length) throw new UnprocessableError('PRODUCT_UNAVAILABLE', 'Some products are unavailable', { productIds: missing });
@@ -398,6 +420,9 @@ export class OrderService {
       const order = await this.repo.load(c, id, true);
       if (!order || (order.userId !== requester.sub && !requester.isAdmin)) throw new NotFoundError('Order');
       assertTransition(order.status, 'CANCELLED');
+      if (!requester.isAdmin && (await c.query(`SELECT 1 FROM deliveries WHERE order_id = $1 AND status IN ('picked_up','at_dropoff')`, [id])).rowCount) {
+        throw new UnprocessableError('ORDER_ON_THE_WAY', 'Your order is already on its way, so it can’t be cancelled now. You can return it once it arrives.');
+      }
       // Everything that doesn't need the (hot) inventory row is done first, so that lock is held for as short a time as possible.
       let refundRequired = false;
       let paymentRef: string | null = null;

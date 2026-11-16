@@ -101,6 +101,8 @@ export function registerSupportRoutes(app: FastifyInstance, svc: SupportServices
     const ctx = await riders.context(p.sub, p.sid, String(req.id));
     return { id: ctx.id, name: ctx.name };
   }
+  app.get('/v1/rider/help/articles', async (req) => { await riderPerson(req); const q = parse(HelpSearchSchema, req.query); return support.search(q.q, q.category, 'rider'); });
+  app.get('/v1/rider/help/articles/:id', async (req) => { await riderPerson(req); return support.readArticle(parse(IdParam, req.params).id, true); });
   app.post('/v1/rider/support/tickets', async (req, reply) => reply.status(201).send(await support.open('rider', await riderPerson(req), parse(OwnTicketSchema, req.body))));
   app.get('/v1/rider/support/tickets', async (req, reply) => { NoStore(reply); return support.myTickets((await riderPerson(req)).id); });
   app.get('/v1/rider/support/tickets/:id', async (req, reply) => { NoStore(reply); return support.mine((await riderPerson(req)).id, parse(IdParam, req.params).id); });

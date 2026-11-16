@@ -143,25 +143,26 @@ export class StorefrontService {
     return this.db.read(async (c) => {
       const cats = (await c.query<{ id: string; name: string; handle: string; description: string }>('SELECT id, name, handle, description FROM categories ORDER BY sort_order, name')).rows;
       const subs = (await c.query<{ category_id: string; name: string }>('SELECT category_id, name FROM subcategories ORDER BY name')).rows;
+      const attrs = (await c.query<{ category_id: string; key: string; label: string; kind: string; unit: string; choices: string[]; is_option: boolean; filterable: boolean }>('SELECT category_id, key, label, kind, unit, choices, is_option, filterable FROM category_attributes ORDER BY position, label')).rows;
       const brands = (await c.query<{ id: string; name: string; origin: string }>(`SELECT id, name, origin FROM brands WHERE status = 'active' ORDER BY name`)).rows;
-      const prods = (await c.query<{ id: string; name: string; description: string; price_cents: number; currency: string; category: string | null; handle: string | null; subcategory: string; brand: string | null; brand_id: string | null; variants: unknown; available: number | null; created_at: Date; images: string[]; rating: string | null; reviews: number }>(
-        `SELECT p.id, p.name, p.description, p.price_cents, p.currency, g.id AS category, g.handle, p.subcategory, b.name AS brand, b.id AS brand_id, p.variants, i.available, p.created_at,
+      const prods = (await c.query<{ id: string; name: string; description: string; price_cents: number; currency: string; category: string | null; handle: string | null; subcategory: string; brand: string | null; brand_id: string | null; variants: unknown; group_id: string | null; options: Record<string, string>; specs: Record<string, unknown>; available: number | null; created_at: Date; images: string[]; rating: string | null; reviews: number }>(
+        `SELECT p.id, p.name, p.description, p.price_cents, p.currency, g.id AS category, g.handle, p.subcategory, b.name AS brand, b.id AS brand_id, p.variants, p.group_id, p.options, p.specs, i.available, p.created_at,
                 COALESCE((SELECT array_agg(pi.upload_id::text ORDER BY pi.position) FROM product_images pi WHERE pi.product_id = p.id), '{}') AS images,
-                (SELECT round(avg(r.rating)::numeric, 1) FROM reviews r JOIN order_items oi ON oi.order_id = r.order_id WHERE oi.product_id = p.id AND r.state = 'visible') AS rating,
-                (SELECT count(*) FROM reviews r JOIN order_items oi ON oi.order_id = r.order_id WHERE oi.product_id = p.id AND r.state = 'visible')::int AS reviews
+                (SELECT round(avg(r.rating)::numeric, 1) FROM reviews r JOIN order_items oi ON oi.order_id = r.order_id WHERE oi.product_id IN (SELECT x.id FROM products x WHERE x.id = p.id OR (x.group_id IS NOT NULL AND x.group_id = p.group_id)) AND r.state = 'visible') AS rating,
+                (SELECT count(*) FROM reviews r JOIN order_items oi ON oi.order_id = r.order_id WHERE oi.product_id IN (SELECT x.id FROM products x WHERE x.id = p.id OR (x.group_id IS NOT NULL AND x.group_id = p.group_id)) AND r.state = 'visible')::int AS reviews
            FROM products p LEFT JOIN categories g ON g.id = p.category_id LEFT JOIN brands b ON b.id = p.brand_id LEFT JOIN inventory i ON i.product_id = p.id
           WHERE p.status = 'active' AND p.active ORDER BY p.created_at DESC LIMIT 2000`)).rows;
       const sale = new Map((await this.promotions.livePrices()).items.map((s) => [s.productId, s]));
       const cutoff = Date.now() - 14 * 86_400_000;
       return {
-        categories: cats.map((g) => ({ id: g.id, handle: g.handle, name: g.name, description: g.description, subcategories: subs.filter((s) => s.category_id === g.id).map((s) => s.name) })),
+        categories: cats.map((g) => ({ id: g.id, handle: g.handle, name: g.name, description: g.description, subcategories: subs.filter((s) => s.category_id === g.id).map((s) => s.name), attributes: attrs.filter((a) => a.category_id === g.id).map((a) => ({ key: a.key, label: a.label, kind: a.kind, unit: a.unit, choices: a.choices, isOption: a.is_option, filterable: a.filterable })) })),
         brands: brands.map((b) => ({ id: b.id, name: b.name, origin: b.origin })),
         products: prods.map((p) => {
           const s = sale.get(p.id);
           return {
             id: p.id, name: p.name, description: p.description, brand: p.brand, brandId: p.brand_id, categoryId: p.category, categoryHandle: p.handle, subcategory: p.subcategory, currency: p.currency,
             listPriceCents: Number(p.price_cents), priceCents: s ? s.saleCents : Number(p.price_cents), onSale: !!s, saleBadge: s?.badge ?? null, saleEndsAt: s?.endsAt ?? null,
-            inStock: (p.available ?? 0) > 0, available: Math.max(0, p.available ?? 0), isNew: p.created_at.getTime() > cutoff, variants: p.variants,
+            inStock: (p.available ?? 0) > 0, available: Math.max(0, p.available ?? 0), isNew: p.created_at.getTime() > cutoff, variants: p.variants, groupId: p.group_id, options: p.options, specs: p.specs,
             images: p.images.map((id) => `/v1/files/${id}`), rating: p.rating === null ? null : Number(p.rating), reviews: p.reviews,
           };
         }),

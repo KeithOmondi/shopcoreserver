@@ -3,7 +3,7 @@ import type { FastifyInstance } from 'fastify';
 import type { Action, Module } from '../modules/staff/permissions.js';
 import type { StaffContext } from '../modules/staff/staff.js';
 import {
-  AdminCreateProductSchema, AdminProductListSchema, AdminUpdateProductSchema, BrandPatchSchema, BrandSchema, CategoryPatchSchema, CategorySchema,
+  AddVariantsSchema, AdminCreateProductSchema, AdminProductListSchema, AttributesSchema, AdminUpdateProductSchema, BrandPatchSchema, BrandSchema, CategoryPatchSchema, CategorySchema,
   LocationPatchSchema, LocationSchema, SupplierPatchSchema, SupplierSchema, type CatalogService,
 } from '../modules/catalog/catalog.js';
 import { AdjustSchema, AlertRulesSchema, LevelsQuerySchema, MovementsQuerySchema, TransferSchema, type InventoryService } from '../modules/inventory/inventory.js';
@@ -31,6 +31,7 @@ export function registerAdminRoutes(app: FastifyInstance, svc: AdminServices, au
 
   // ---- categories & brands -------------------------------------------------------------------
   app.get('/v1/admin/categories', (req) => guard(req, [['Products', 'View']], async () => ({ items: await catalog.categories() })));
+  app.put('/v1/admin/categories/:id/attributes', (req) => guard(req, [['Products', 'Edit']], (a) => catalog.saveAttributes(parse(IdParam, req.params).id, parse(AttributesSchema, req.body), a)));
   app.post('/v1/admin/categories', (req, reply) => guard(req, [['Products', 'Create']], async (a) => reply.status(201).send(await catalog.createCategory(parse(CategorySchema, req.body), a))));
   app.patch('/v1/admin/categories/:id', (req) => guard(req, [['Products', 'Edit']], (a) => catalog.updateCategory(parse(IdParam, req.params).id, parse(CategoryPatchSchema, req.body), a)));
   app.delete('/v1/admin/categories/:id', (req, reply) => guard(req, [['Products', 'Delete']], async (a) => { await catalog.deleteCategory(parse(IdParam, req.params).id, a); return reply.status(204).send(); }));
@@ -57,6 +58,9 @@ export function registerAdminRoutes(app: FastifyInstance, svc: AdminServices, au
     const p = await catalog.createProduct(parse(AdminCreateProductSchema, req.body), a);
     return reply.status(201).header('location', `/v1/admin/products/${p.id}`).send(p);
   }));
+  app.get('/v1/admin/products/:id/variants', (req, reply) => guard(req, [['Products', 'View']], async () => { NoStore(reply); return catalog.variantsOf(parse(IdParam, req.params).id); }));
+  app.post('/v1/admin/products/:id/copy-images', (req) => guard(req, [['Products', 'Edit']], async (a) => catalog.copyImagesToVariants(parse(IdParam, req.params).id, (req.query as { replace?: string }).replace === 'true', a)));
+  app.post('/v1/admin/products/:id/variants', (req, reply) => guard(req, [['Products', 'Create']], async (a) => reply.status(201).send(await catalog.addVariants(parse(IdParam, req.params).id, parse(AddVariantsSchema, req.body), a))));
   app.patch('/v1/admin/products/:id', (req) => guard(req, [['Products', 'Edit']], (a) => catalog.updateProduct(parse(IdParam, req.params).id, ifMatch(req), parse(AdminUpdateProductSchema, req.body), a)));
 
   // ---- stock ---------------------------------------------------------------------------------------------

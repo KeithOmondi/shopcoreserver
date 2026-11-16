@@ -1,10 +1,12 @@
 import cluster from 'node:cluster';
 import http from 'node:http';
+import path from 'node:path';
 import { loadConfig } from './config/index.js';
 import { createLogger } from './infra/logger.js';
 import { registry } from './infra/metrics.js';
 import { createContainer } from './container.js';
 import { buildApp } from './http/app.js';
+import { migrate } from '../scripts/migrate.js';
 
 /**
  * Process entrypoint.
@@ -70,6 +72,12 @@ async function startWorker() {
 }
 
 async function main() {
+  // Hosts without a separate migration job (Render, a single VM) can have the API apply waiting migrations before it listens.
+  if (cluster.isPrimary && process.env.RUN_MIGRATIONS === 'true') {
+    const cfg = loadConfig();
+    const applied = await migrate(process.env.DATABASE_MIGRATION_URL ?? cfg.DATABASE_URL, process.env.MIGRATIONS_DIR ?? path.resolve(__dirname, '../../migrations'), (m) => console.log(JSON.stringify({ level: 'info', msg: m })), cfg.DB_SSL ? { rejectUnauthorized: cfg.DB_SSL_VERIFY } : undefined);
+    console.log(JSON.stringify({ level: 'info', msg: applied.length ? `applied ${applied.length} migration(s)` : 'schema up to date' }));
+  }
   const workers = Number(process.env.WORKERS ?? 1);
   if (workers > 1 && cluster.isPrimary) {
     let stopping = false;

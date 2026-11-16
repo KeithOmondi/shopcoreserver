@@ -6,6 +6,7 @@ import { decodeCursor, encodeCursor } from '../../http/pagination.js';
 import { patchOf } from '../../http/validate.js';
 import { audit, outbox, type Actor, type ProductService } from '../products/products.js';
 import { applyMoves, primaryLocation } from '../inventory/stock.js';
+import { AttributesSchema, attributeView, attrKey, attributesOf, checkAttributes, checkValues, type AttributeRow, type Values } from './attributes.js';
 
 const uuid = z.string().refine(isUuid, 'must be a UUID');
 export const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
@@ -49,12 +50,26 @@ const productFields = {
   status: z.enum(['active', 'draft', 'archived']).default('active'), reorderAt: z.number().int().min(0).max(1_000_000).default(10),
   handle: z.string().trim().max(120).default(''), seoTitle: z.string().trim().max(120).default(''), seoDesc: z.string().trim().max(300).default(''),
   variants: z.array(Variant).max(100).default([]),
+  /** Facts about the product, from the fields its category defines (RAM, material...). */
+  specs: z.record(z.string().max(40), z.union([z.string().max(200), z.number(), z.boolean()])).default({}),
+  /** Which choice this product is for each option its category defines (size M, colour Red). */
+  options: z.record(z.string().max(40), z.union([z.string().max(200), z.number()])).default({}),
 };
 export const AdminCreateProductSchema = z.strictObject({
   sku: z.string().regex(/^[A-Z0-9][A-Z0-9_-]{0,63}$/), ...productFields,
   initialStock: z.number().int().min(0).max(10_000_000).default(0), locationId: uuid.optional(),
 });
 export const AdminUpdateProductSchema = patchOf(z.strictObject(productFields));
+/** Several variants of one item at once: each is a sellable product with its own SKU, price and stock. */
+export const AddVariantsSchema = z.strictObject({
+  variants: z.array(z.strictObject({
+    sku: z.string().regex(/^[A-Z0-9][A-Z0-9_-]{0,63}$/), options: z.record(z.string().max(40), z.union([z.string().max(200), z.number()])),
+    priceCents: z.number().int().min(0).max(1_000_000_000_00).optional(), costCents: z.number().int().min(0).optional(), barcode: z.string().trim().max(32).default(''),
+    initialStock: z.number().int().min(0).max(10_000_000).default(0),
+  })).min(1).max(100),
+  locationId: uuid.optional(),
+});
+export { AttributesSchema };
 export const AdminProductListSchema = z.object({
   q: z.string().trim().max(100).optional(), categoryId: uuid.optional(), status: z.enum(['active', 'draft', 'archived']).optional(),
   stock: z.enum(['in', 'low', 'out']).optional(), limit: z.coerce.number().int().min(1).max(200).default(50), cursor: z.string().max(200).optional(),
@@ -67,8 +82,12 @@ interface ProductRow {
   created_at: Date; updated_at: Date; category_id: string | null; category: string | null; subcategory: string; brand_id: string | null; brand: string | null;
   supplier_id: string | null; supplier: string | null; cost_cents: number; barcode: string; tax: string; track_stock: boolean; status: string;
   reorder_at: number; handle: string; seo_title: string; seo_desc: string; variants: unknown; available: number | null; reserved: number | null;
+  group_id: string | null; options: Record<string, string>; specs: Values; cover_image?: string | null;
 }
-const PRODUCT_SELECT = `SELECT p.*, c.name AS category, b.name AS brand, s.name AS supplier, i.available, i.reserved
+// cover_image: this product's first picture, or failing that one from another variant of the same item.
+const PRODUCT_SELECT = `SELECT p.*, c.name AS category, b.name AS brand, s.name AS supplier, i.available, i.reserved,
+    COALESCE((SELECT pi.upload_id FROM product_images pi WHERE pi.product_id = p.id ORDER BY pi.position LIMIT 1),
+             (SELECT pi.upload_id FROM product_images pi JOIN products x ON x.id = pi.product_id WHERE p.group_id IS NOT NULL AND x.group_id = p.group_id ORDER BY pi.position LIMIT 1)) AS cover_image
   FROM products p LEFT JOIN categories c ON c.id = p.category_id LEFT JOIN brands b ON b.id = p.brand_id
   LEFT JOIN suppliers s ON s.id = p.supplier_id LEFT JOIN inventory i ON i.product_id = p.id`;
 
@@ -77,9 +96,13 @@ export const toAdminProduct = (r: ProductRow) => ({
   categoryId: r.category_id, category: r.category, subcategory: r.subcategory, brandId: r.brand_id, brand: r.brand,
   supplierId: r.supplier_id, supplier: r.supplier, costCents: r.cost_cents, barcode: r.barcode, tax: r.tax, trackStock: r.track_stock,
   status: r.status, reorderAt: r.reorder_at, handle: r.handle, seoTitle: r.seo_title, seoDesc: r.seo_desc, variants: r.variants,
+  groupId: r.group_id, options: r.options, specs: r.specs, coverImage: r.cover_image ?? null,
   /** Sellable now. */ available: r.available ?? 0, /** Held for orders awaiting payment. */ reserved: r.reserved ?? 0,
   version: r.version, createdAt: r.created_at.toISOString(), updatedAt: r.updated_at.toISOString(),
 });
+
+/** Columns that describe the item as a whole. Changing one on a variant changes it on all of that item's variants. */
+const SHARED_COLUMNS = ['name', 'description', 'category_id', 'subcategory', 'brand_id', 'supplier_id', 'tax', 'track_stock', 'status', 'active', 'handle', 'seo_title', 'seo_desc', 'specs', 'currency'];
 
 export class CatalogService {
   constructor(private readonly db: Database, private readonly products: ProductService) {}
@@ -134,7 +157,8 @@ export class CatalogService {
       const { rows: cs } = await c.query<{ id: string; name: string; handle: string; description: string; products: number }>(
         `SELECT c.id, c.name, c.handle, c.description, count(p.id)::int AS products FROM categories c LEFT JOIN products p ON p.category_id = c.id GROUP BY c.id ORDER BY c.sort_order, c.name`);
       const { rows: subs } = await c.query<{ category_id: string; name: string }>('SELECT category_id, name FROM subcategories ORDER BY name');
-      return cs.map((x) => ({ ...x, subcategories: subs.filter((s) => s.category_id === x.id).map((s) => s.name) }));
+      const attrs = (await c.query<AttributeRow & { category_id: string }>('SELECT category_id, id, key, label, kind, unit, choices, is_option, required, filterable, position FROM category_attributes ORDER BY position, label')).rows;
+      return cs.map((x) => ({ ...x, subcategories: subs.filter((s) => s.category_id === x.id).map((s) => s.name), attributes: attrs.filter((a) => a.category_id === x.id).map(attributeView) }));
     });
   }
 
@@ -166,6 +190,32 @@ export class CatalogService {
       await audit(c, actor, 'category.update', 'category', id, patch);
     });
     return (await this.categories()).find((x) => x.id === id)!;
+  }
+
+  /** Replaces the fields a category's products carry. Fields keep their key (made from the name) so existing products keep their values. */
+  async saveAttributes(categoryId: string, input: z.infer<typeof AttributesSchema>, actor: Actor) {
+    checkAttributes(input.attributes);
+    await this.db.tx(async (c) => {
+      if (!(await c.query('SELECT 1 FROM categories WHERE id = $1 FOR UPDATE', [categoryId])).rowCount) throw new NotFoundError('Category');
+      const keep = input.attributes.map((a) => attrKey(a.label));
+      // An option that products are already sold by can't be taken away or turned into a plain fact.
+      const before = await attributesOf(c, categoryId);
+      for (const b of before.filter((x) => x.is_option)) {
+        const next = input.attributes.find((a) => attrKey(a.label) === b.key);
+        if (next && next.isOption) continue;
+        const used = (await c.query<{ n: number }>('SELECT count(*)::int AS n FROM products WHERE category_id = $1 AND options ? $2', [categoryId, b.key])).rows[0]!.n;
+        if (used) throw new ConflictError('OPTION_IN_USE', `${used} product${used === 1 ? ' is' : 's are'} sold by ${b.label}. Remove or archive those first.`);
+      }
+      await c.query('DELETE FROM category_attributes WHERE category_id = $1 AND key <> ALL($2::text[])', [categoryId, keep]);
+      for (const [i, a] of input.attributes.entries()) {
+        await c.query(
+          `INSERT INTO category_attributes (id, category_id, key, label, kind, unit, choices, is_option, required, filterable, position) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+           ON CONFLICT (category_id, key) DO UPDATE SET label = $4, kind = $5, unit = $6, choices = $7, is_option = $8, required = $9, filterable = $10, position = $11`,
+          [uuidv7(), categoryId, attrKey(a.label), a.label, a.kind, a.unit, JSON.stringify(a.choices), a.isOption, a.required || a.isOption, a.filterable, i]);
+      }
+      await audit(c, actor, 'category.attributes', 'category', categoryId, { count: input.attributes.length });
+    });
+    return (await this.categories()).find((x) => x.id === categoryId)!;
   }
 
   async deleteCategory(id: string, actor: Actor) {
@@ -248,7 +298,7 @@ export class CatalogService {
       const { rows } = await c.query<ProductRow>(
         `${PRODUCT_SELECT}
           WHERE ($1::uuid IS NULL OR p.id < $1)
-            AND ($2::text IS NULL OR p.name ILIKE '%' || $2 || '%' OR p.sku ILIKE '%' || $2 || '%' OR p.barcode = $2)
+            AND ($2::text IS NULL OR p.name ILIKE '%' || $2 || '%' OR p.sku ILIKE '%' || $2 || '%' OR p.barcode = $2 OR p.options::text ILIKE '%' || $2 || '%' OR p.specs::text ILIKE '%' || $2 || '%')
             AND ($3::uuid IS NULL OR p.category_id = $3) AND ($4::text IS NULL OR p.status = $4)
             AND ($5::text IS NULL OR ($5 = 'out' AND COALESCE(i.available, 0) = 0)
                  OR ($5 = 'low' AND COALESCE(i.available, 0) > 0 AND COALESCE(i.available, 0) <= p.reorder_at)
@@ -266,7 +316,8 @@ export class CatalogService {
       if (!r) throw new NotFoundError('Product');
       const { rows: levels } = await c.query<{ location_id: string; name: string; on_hand: number }>(
         `SELECT sl.location_id, l.name, sl.on_hand FROM stock_levels sl JOIN locations l ON l.id = sl.location_id WHERE sl.product_id = $1 ORDER BY l.sort_order`, [id]);
-      return { ...toAdminProduct(r), levels: levels.map((l) => ({ locationId: l.location_id, location: l.name, onHand: l.on_hand })) };
+      const images = (await c.query<{ upload_id: string }>('SELECT upload_id FROM product_images WHERE product_id = $1 ORDER BY position', [id])).rows;
+      return { ...toAdminProduct(r), images: images.map((i) => ({ id: i.upload_id, url: `/v1/files/${i.upload_id}` })), levels: levels.map((l) => ({ locationId: l.location_id, location: l.name, onHand: l.on_hand })) };
     });
   }
 
@@ -276,16 +327,97 @@ export class CatalogService {
     }
   }
 
+  /** Checks specs and options against the category. Without a category there is nothing to check against, so none are allowed. */
+  private async cleanValues(c: Queryable, categoryId: string | null, specs: Values, options: Values) {
+    if (!categoryId) {
+      if (Object.keys(specs).length || Object.keys(options).length) throw new ValidationError([{ path: ['categoryId'], message: 'Choose a category first: its fields decide what a product carries' }]);
+      return { specs: {} as Values, options: {} as Record<string, string> };
+    }
+    return checkValues(await attributesOf(c, categoryId), specs, options);
+  }
+
+  /** Adds variants (other sizes, colours, storage...) to a product. The product becomes the first variant of a group; each new one is its own sellable product. */
+  async addVariants(sourceId: string, input: z.infer<typeof AddVariantsSchema>, actor: Actor) {
+    const ids: string[] = [];
+    await this.db.tx(async (c) => {
+      const src = (await c.query<ProductRow>(`${PRODUCT_SELECT} WHERE p.id = $1 FOR UPDATE OF p`, [sourceId])).rows[0];
+      if (!src) throw new NotFoundError('Product');
+      if (!src.category_id) throw new UnprocessableError('NO_CATEGORY', 'Put this product in a category first. The category decides which options it has.');
+      const attrs = await attributesOf(c, src.category_id);
+      if (!attrs.some((a) => a.is_option)) throw new UnprocessableError('NO_OPTIONS', 'This category has no options yet (such as size or colour). Add them to the category first.');
+      // The product being copied must itself say which choice it is, so shoppers can tell the variants apart.
+      const own = checkValues(attrs, src.specs ?? {}, src.options ?? {});
+      const group = src.group_id ?? src.id;
+      if (!src.group_id) await c.query('UPDATE products SET group_id = $2, options = $3, version = version + 1, updated_at = now() WHERE id = $1', [src.id, group, JSON.stringify(own.options)]);
+      const primary = input.locationId ?? (await primaryLocation(c));
+      for (const v of input.variants) {
+        const clean = checkValues(attrs, {}, v.options, true);
+        const id = uuidv7();
+        await c.query(
+          `INSERT INTO products (id, sku, name, description, price_cents, currency, active, category_id, subcategory, brand_id, supplier_id, cost_cents, barcode, tax, track_stock, status, reorder_at, handle, seo_title, seo_desc, variants, specs, options, group_id)
+           SELECT $1, $2, name, description, $3, currency, active, category_id, subcategory, brand_id, supplier_id, $4, $5, tax, track_stock, status, reorder_at, handle, seo_title, seo_desc, '[]'::jsonb, specs, $6, $7 FROM products WHERE id = $8`,
+          [id, v.sku, v.priceCents ?? src.price_cents, v.costCents ?? src.cost_cents, v.barcode, JSON.stringify(clean.options), group, src.id],
+        ).catch((e: { code?: string; constraint?: string }) => {
+          if (e.code === '23505') {
+            if (e.constraint === 'products_group_options_key') throw new ConflictError('VARIANT_EXISTS', 'That combination of options already exists for this product');
+            throw new ConflictError(e.constraint === 'products_barcode_key' ? 'BARCODE_EXISTS' : 'SKU_EXISTS', e.constraint === 'products_barcode_key' ? 'Another product already uses that barcode' : `SKU ${v.sku} already exists`);
+          }
+          throw e;
+        });
+        await c.query('INSERT INTO inventory (product_id, available) VALUES ($1, 0)', [id]);
+        await c.query('INSERT INTO product_images (product_id, upload_id, position) SELECT $1, upload_id, position FROM product_images WHERE product_id = $2', [id, src.id]);
+        if (v.initialStock > 0) await applyMoves(c, [{ productId: id, locationId: primary, delta: v.initialStock, type: 'Opening stock', ref: 'NEW-VARIANT' }], { id: actor.id, name: actor.name ?? 'Staff' });
+        await outbox(c, 'product', id, 'ProductCreated', { id, sku: v.sku, name: src.name });
+        ids.push(id);
+      }
+      await audit(c, actor, 'product.variants', 'product', sourceId, { added: ids.length });
+    });
+    for (const id of [sourceId, ...ids]) await this.products.invalidate(id);
+    return { group: (await this.getProduct(sourceId)).groupId, items: await Promise.all(ids.map((id) => this.getProduct(id))) };
+  }
+
+  /** Gives every other variant of this product's group the pictures this one has (variants that already have pictures keep theirs unless replace is set). */
+  async copyImagesToVariants(id: string, replace: boolean, actor: Actor) {
+    let copied = 0;
+    await this.db.tx(async (c) => {
+      const src = (await c.query<{ group_id: string | null }>('SELECT group_id FROM products WHERE id = $1', [id])).rows[0];
+      if (!src) throw new NotFoundError('Product');
+      if (!src.group_id) return;
+      const others = (await c.query<{ id: string }>('SELECT id FROM products WHERE group_id = $1 AND id <> $2', [src.group_id, id])).rows;
+      for (const o of others) {
+        const has = (await c.query('SELECT 1 FROM product_images WHERE product_id = $1 LIMIT 1', [o.id])).rowCount;
+        if (has && !replace) continue;
+        await c.query('DELETE FROM product_images WHERE product_id = $1', [o.id]);
+        await c.query('INSERT INTO product_images (product_id, upload_id, position) SELECT $1, upload_id, position FROM product_images WHERE product_id = $2', [o.id, id]);
+        copied++;
+      }
+      await audit(c, actor, 'product.images_copied', 'product', id, { variants: copied });
+    });
+    await this.products.invalidate(id);
+    return { copied };
+  }
+
+  /** Every variant of the group a product belongs to (just itself if it has none). */
+  async variantsOf(id: string) {
+    return this.db.read(async (c) => {
+      const r = (await c.query<ProductRow>(`${PRODUCT_SELECT} WHERE p.id = $1`, [id])).rows[0];
+      if (!r) throw new NotFoundError('Product');
+      const rows = r.group_id ? (await c.query<ProductRow>(`${PRODUCT_SELECT} WHERE p.group_id = $1 ORDER BY p.created_at, p.sku`, [r.group_id])).rows : [r];
+      return { items: rows.map(toAdminProduct) };
+    });
+  }
+
   async createProduct(input: z.infer<typeof AdminCreateProductSchema>, actor: Actor) {
     const id = uuidv7();
     const handle = input.handle ? slug(input.handle) : slug(input.name);
     await this.db.tx(async (c) => {
       await this.assertRefs(c, input);
+      const clean = await this.cleanValues(c, input.categoryId, input.specs, input.options);
       await c.query(
-        `INSERT INTO products (id, sku, name, description, price_cents, currency, active, category_id, subcategory, brand_id, supplier_id, cost_cents, barcode, tax, track_stock, status, reorder_at, handle, seo_title, seo_desc, variants)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)`,
+        `INSERT INTO products (id, sku, name, description, price_cents, currency, active, category_id, subcategory, brand_id, supplier_id, cost_cents, barcode, tax, track_stock, status, reorder_at, handle, seo_title, seo_desc, variants, specs, options)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`,
         [id, input.sku, input.name, input.description, input.priceCents, input.currency, input.status === 'active', input.categoryId, input.subcategory, input.brandId, input.supplierId,
-          input.costCents, input.barcode, input.tax, input.trackStock, input.status, input.reorderAt, handle, input.seoTitle, input.seoDesc, JSON.stringify(input.variants)],
+          input.costCents, input.barcode, input.tax, input.trackStock, input.status, input.reorderAt, handle, input.seoTitle, input.seoDesc, JSON.stringify(input.variants), JSON.stringify(clean.specs), JSON.stringify(clean.options)],
       ).catch((e: { code?: string; constraint?: string }) => {
         if (e.code === '23505') throw new ConflictError(e.constraint === 'products_barcode_key' ? 'BARCODE_EXISTS' : 'SKU_EXISTS', e.constraint === 'products_barcode_key' ? 'Another product already uses that barcode' : 'SKU already exists');
         throw e;
@@ -304,9 +436,22 @@ export class CatalogService {
   async updateProduct(id: string, version: number, p: z.infer<typeof AdminUpdateProductSchema>, actor: Actor) {
     await this.db.tx(async (c) => {
       await this.assertRefs(c, p);
+      const cur = (await c.query<{ category_id: string | null; specs: Values; options: Values; group_id: string | null }>('SELECT category_id, specs, options, group_id FROM products WHERE id = $1 FOR UPDATE', [id])).rows[0];
+      if (!cur) throw new NotFoundError('Product');
       const sets: string[] = [];
       const args: unknown[] = [id, version];
-      const set = (col: string, val: unknown) => { args.push(val); sets.push(`${col} = $${args.length}`); };
+      const shared: [string, unknown][] = [];
+      const set = (col: string, val: unknown) => { args.push(val); sets.push(`${col} = $${args.length}`); if (SHARED_COLUMNS.includes(col)) shared.push([col, val]); };
+      if (p.categoryId !== undefined || p.specs !== undefined || p.options !== undefined) {
+        const catId = p.categoryId !== undefined ? p.categoryId : cur.category_id;
+        if (cur.group_id && p.categoryId !== undefined && p.categoryId !== cur.category_id) {
+          const mates = (await c.query<{ n: number }>('SELECT count(*)::int AS n FROM products WHERE group_id = $1 AND id <> $2', [cur.group_id, id])).rows[0]!.n;
+          if (mates) throw new UnprocessableError('GROUP_CATEGORY', 'This product has variants. Create a new product to use a different category.');
+        }
+        const clean = await this.cleanValues(c, catId, p.specs ?? cur.specs, p.options ?? cur.options);
+        if (p.specs !== undefined || p.categoryId !== undefined) set('specs', JSON.stringify(clean.specs));
+        if (p.options !== undefined || p.categoryId !== undefined) set('options', JSON.stringify(clean.options));
+      }
       if (p.name !== undefined) set('name', p.name);
       if (p.description !== undefined) set('description', p.description);
       if (p.priceCents !== undefined) set('price_cents', p.priceCents);
@@ -330,6 +475,12 @@ export class CatalogService {
       if (!rowCount) {
         if (!(await c.query('SELECT 1 FROM products WHERE id = $1', [id])).rowCount) throw new NotFoundError('Product');
         throw new ConflictError('VERSION_CONFLICT', 'Someone else changed this product. Reload and try again.');
+      }
+      // What describes the item as a whole is kept the same across its variants.
+      if (cur.group_id && shared.length) {
+        const a: unknown[] = [cur.group_id, id];
+        const cols = shared.map(([col, val]) => { a.push(val); return `${col} = $${a.length}`; });
+        await c.query(`UPDATE products SET ${cols.join(', ')}, version = version + 1, updated_at = now() WHERE group_id = $1 AND id <> $2`, a);
       }
       await audit(c, actor, 'product.update', 'product', id, { version, fields: Object.keys(p) });
       await outbox(c, 'product', id, 'ProductUpdated', { id, fields: Object.keys(p) });

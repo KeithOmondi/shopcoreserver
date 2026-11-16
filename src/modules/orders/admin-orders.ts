@@ -80,6 +80,9 @@ export class AdminOrdersService {
       if (!o) throw new NotFoundError('Order');
       const items = (await c.query<{ product_id: string; sku: string; name: string; quantity: number; unit_price_cents: number }>('SELECT product_id, sku, name, quantity, unit_price_cents FROM order_items WHERE order_id = $1 ORDER BY line_no', [id])).rows;
       const notes = (await c.query<{ id: number; body: string; by_name: string; created_at: Date }>('SELECT id, body, by_name, created_at FROM order_notes WHERE order_id = $1 ORDER BY id', [id])).rows;
+      const dv = (await c.query<{ id: string; status: string; rider_id: string; name: string; phone: string; vehicle: string | null; plate: string | null; handover_code: string | null }>(
+        `SELECT d.id, d.status, d.rider_id, r.name, r.phone, r.vehicle, r.plate, d.handover_code FROM deliveries d JOIN riders r ON r.id = d.rider_id
+          WHERE d.order_id = $1 ORDER BY (d.status IN ('delivered')) DESC, (d.status NOT IN ('failed','cancelled')) DESC, d.created_at DESC LIMIT 1`, [id])).rows[0];
       const events: { kind: string; at: string; by?: string; note?: string }[] = [{ kind: 'Placed', at: o.created_at.toISOString() }];
       if (o.paid_at) events.push({ kind: 'Paid', at: o.paid_at.toISOString(), note: o.payment_method ? { mpesa: 'M-Pesa', card: 'Card', cod: 'Cash on delivery' }[o.payment_method] : undefined });
       if (o.packed_at) events.push({ kind: 'Packed', at: o.packed_at.toISOString(), by: o.packed_by ?? undefined });
@@ -93,6 +96,9 @@ export class AdminOrdersService {
         customer: { id: o.user_id, name: o.c_name || o.delivery_name || 'Customer', phone: o.delivery_phone || o.c_phone || '', email: o.c_email || '' },
         delivery: { name: o.delivery_name ?? o.c_name ?? '', phone: o.delivery_phone ?? o.c_phone ?? '', area: o.delivery_area ?? o.c_area ?? '', address: o.delivery_address ?? o.c_street ?? '' },
         items: items.map((i) => ({ productId: i.product_id, sku: i.sku, name: i.name, quantity: i.quantity, unitPriceCents: i.unit_price_cents, lineTotalCents: i.quantity * i.unit_price_cents })),
+        packing: { stage: o.packed_at ? 'packed' : 'pick', picked: o.picked ?? [], packedAt: o.packed_at?.toISOString() ?? null, packedBy: o.packed_by },
+        dispatch: dv && !['failed', 'cancelled'].includes(dv.status) ? { deliveryId: dv.id, status: dv.status, riderId: dv.rider_id, riderName: dv.name, riderPhone: dv.phone, vehicle: dv.vehicle, plate: dv.plate } : null,
+        canCancel: o.status === 'PENDING_PAYMENT' || o.status === 'PAID',
         events, notes: notes.map((n) => ({ id: String(n.id), text: n.body, by: n.by_name, at: n.created_at.toISOString() })),
       };
     });
@@ -154,8 +160,11 @@ export class CustomersService {
       const recent = (await c.query<{ id: string; order_no: number; total_cents: number; created_at: Date; status: string }>(
         `SELECT o.id, o.order_no, o.total_cents, o.created_at, ${DISPLAY_STATUS} AS status FROM orders o LEFT JOIN pack_state ps ON ps.order_id = o.id WHERE o.user_id = $1 ORDER BY o.created_at DESC LIMIT 10`, [id])).rows;
       const notes = (await c.query<{ id: number; body: string; by_name: string; created_at: Date }>('SELECT id, body, by_name, created_at FROM customer_notes WHERE customer_id = $1 ORDER BY id DESC LIMIT 50', [id])).rows;
+      const addresses = (await c.query<{ id: string; label: string; full_name: string; phone: string; county: string; area: string; street: string; is_default: boolean }>(
+        'SELECT id, label, full_name, phone, county, area, street, is_default FROM customer_addresses WHERE customer_id = $1 ORDER BY is_default DESC, created_at', [id])).rows;
       return {
         ...customerView(r),
+        addresses: addresses.map((a) => ({ id: a.id, label: a.label, name: a.full_name, phone: a.phone, county: a.county, area: a.area, street: a.street, isDefault: a.is_default })),
         recentOrders: recent.map((o) => ({ id: o.id, number: `SC-${o.order_no}`, totalCents: o.total_cents, status: o.status, at: o.created_at.toISOString() })),
         notes: notes.map((n) => ({ id: String(n.id), text: n.body, by: n.by_name, at: n.created_at.toISOString() })),
       };

@@ -6,6 +6,11 @@ import { Database } from './infra/db.js';
 import { OrderRepository, OrderService } from './modules/orders/orders.js';
 import { DispatchService } from './modules/dispatch/dispatch.js';
 import { EngageService } from './modules/marketing/engage.js';
+import { PushService } from './modules/integrations/push.js';
+import { makeSms } from './modules/integrations/sms.js';
+import { makeEmail } from './modules/integrations/email.js';
+import { OrderConfirmationMailer } from './modules/orders/confirmation.js';
+import { CampaignSender } from './modules/marketing/sender.js';
 import { KafkaPublisher, LogPublisher, OutboxRelay } from './workers/outbox-relay.js';
 
 /**
@@ -26,8 +31,13 @@ async function main() {
   if (!cfg.KAFKA_BROKERS) log.warn('KAFKA_BROKERS not set: using log publisher (development only)');
   const relay = new OutboxRelay(db.writer, publisher, cfg, log);
   const orders = new OrderService(db, new OrderRepository());
-  const dispatch = new DispatchService(db);
-  const engage = new EngageService(db);
+  // Scheduled campaigns are sent from here, so the worker needs the real text and email senders too.
+  const sms = makeSms(cfg, log);
+  const dispatch = new DispatchService(db, sms);
+  const email = makeEmail(cfg, log);
+  const engage = new EngageService(db, new CampaignSender(db, sms, email, log));
+  const confirmations = new OrderConfirmationMailer(db, email, log);
+  const push = new PushService(db, cfg, log);
 
   const timers: NodeJS.Timeout[] = [];
   const every = (ms: number, name: string, fn: () => Promise<unknown>) => {
@@ -52,6 +62,10 @@ async function main() {
     for (let n = -1; n !== 0; total += n) n = await orders.expireUnpaid(cfg.ORDER_PAYMENT_TIMEOUT_MIN);
     if (total) log.info({ cancelled: total }, 'expired unpaid orders');
   });
+  // Phone notifications waiting in the queue.
+  every(3_000, 'send-push', async () => {
+    for (let n = 1; n > 0;) n = (await push.drain()) >= 100 ? 1 : 0;
+  });
   // Rider offers nobody answered within 75 seconds go back to the dispatch board.
   every(10_000, 'expire-offers', async () => {
     const n = await dispatch.expireOffers();
@@ -61,6 +75,11 @@ async function main() {
   every(30_000, 'marketing-due', async () => {
     const r = await engage.runDue();
     if (r.pushes || r.messages || r.layout) log.info(r, 'marketing sends');
+  });
+  // A receipt email for each order that has been placed and paid (or is cash on delivery).
+  every(15_000, 'order-confirmations', async () => {
+    const n = await confirmations.runDue();
+    if (n) log.info({ sent: n }, 'order confirmation emails');
   });
   every(60_000, 'purge-idempotency', async () => {
     // Batched delete keeps each transaction short and avoids long locks / WAL spikes.

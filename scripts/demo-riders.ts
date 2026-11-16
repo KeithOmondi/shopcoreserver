@@ -34,7 +34,7 @@ async function main() {
   try {
     const existing = new Map((await zones.list()).items.map((z) => [z.name, z.id]));
     for (const [name, fee, commission, areas] of ZONES) {
-      if (!existing.has(name)) existing.set(name, (await zones.create({ name, feeCents: fee * 100, commissionPct: commission, areas, note: '', active: true }, actor)).id);
+      if (!existing.has(name)) existing.set(name, (await zones.create({ name, feeCents: fee * 100, commissionPct: commission, areas, note: '', active: true, county: 'Nairobi' }, actor)).id);
     }
     await zones.saveSettings({ baseFeeCents: 300 * 100, minBasketCents: 0 }, actor);
     const hash = await hashPassword('Ride1234');

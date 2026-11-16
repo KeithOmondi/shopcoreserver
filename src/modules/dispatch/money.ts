@@ -5,6 +5,7 @@ import { isUuid, uuidv7 } from '../../infra/uuid.js';
 import { audit, type Actor } from '../products/products.js';
 import type { RiderContext } from './riders.js';
 import { assertOpen, financeSettings } from '../finance/common.js';
+import { queuePush } from '../integrations/push.js';
 
 const uuid = z.string().refine(isUuid, 'must be a UUID');
 export const WithdrawSchema = z.strictObject({ amountCents: z.number().int().min(1).max(100_000_000) });
@@ -18,20 +19,47 @@ export const DepositSchema = z.strictObject({
 });
 export const AdjustSchema = z.strictObject({ amountCents: z.number().int().refine((n) => n !== 0, 'must be non-zero'), note: z.string().trim().min(3).max(200) });
 
+/** What staff set for the rider programme: withdrawals, the referral bonus and where cash is handed in. */
+export const ProgrammeSchema = z.strictObject({
+  minWithdrawCents: z.number().int().min(0).max(100_000_000), withdrawFeeCents: z.number().int().min(0).max(1_000_000),
+  referralRewardCents: z.number().int().min(0).max(100_000_000), referralGoal: z.number().int().min(1).max(10_000),
+  cashInstructions: z.string().trim().min(5).max(600),
+});
+export type Programme = z.infer<typeof ProgrammeSchema>;
+const PROGRAMME_DEFAULTS: Programme = { minWithdrawCents: 10_000, withdrawFeeCents: 1_500, referralRewardCents: 100_000, referralGoal: 30, cashInstructions: 'Hand your cash to ShopCore dispatch. They record it and it clears from your balance here.' };
+const PROGRAMME_KEYS = { minWithdrawCents: 'rider.min_withdraw_cents', withdrawFeeCents: 'rider.withdraw_fee_cents', referralRewardCents: 'rider.referral_reward_cents', referralGoal: 'rider.referral_goal', cashInstructions: 'rider.cash_instructions' } as const;
+
+export async function programme(c: Queryable): Promise<Programme> {
+  const rows = (await c.query<{ key: string; value: unknown }>('SELECT key, value FROM settings WHERE key = ANY($1::text[])', [Object.values(PROGRAMME_KEYS)])).rows;
+  const out = { ...PROGRAMME_DEFAULTS };
+  for (const [field, key] of Object.entries(PROGRAMME_KEYS) as [keyof Programme, string][]) {
+    const v = rows.find((r) => r.key === key)?.value;
+    if (field === 'cashInstructions') { if (typeof v === 'string' && v.trim()) out.cashInstructions = v; } else if (v !== undefined && Number.isFinite(Number(v))) (out[field] as number) = Number(v);
+  }
+  return out;
+}
+
 interface Settings { minWithdrawCents: number; withdrawFeeCents: number }
-const DEFAULTS: Settings = { minWithdrawCents: 10_000, withdrawFeeCents: 1_500 };
 
 export class RiderMoneyService {
   constructor(private readonly db: Database) {}
 
   async settings(): Promise<Settings> {
-    return this.db.read(async (c) => {
-      const rows = (await c.query<{ key: string; value: number }>(`SELECT key, value FROM settings WHERE key IN ('rider.min_withdraw_cents','rider.withdraw_fee_cents')`)).rows;
-      return {
-        minWithdrawCents: Number(rows.find((r) => r.key === 'rider.min_withdraw_cents')?.value ?? DEFAULTS.minWithdrawCents),
-        withdrawFeeCents: Number(rows.find((r) => r.key === 'rider.withdraw_fee_cents')?.value ?? DEFAULTS.withdrawFeeCents),
-      };
+    return this.db.read(async (c) => { const p = await programme(c); return { minWithdrawCents: p.minWithdrawCents, withdrawFeeCents: p.withdrawFeeCents }; });
+  }
+
+  async programme(): Promise<Programme> {
+    return this.db.read((c) => programme(c));
+  }
+
+  async saveProgramme(input: Programme, actor: Actor) {
+    await this.db.tx(async (c) => {
+      for (const [field, key] of Object.entries(PROGRAMME_KEYS) as [keyof Programme, string][]) {
+        await c.query(`INSERT INTO settings (key, value, updated_by) VALUES ($1,$2,$3) ON CONFLICT (key) DO UPDATE SET value = $2, updated_by = $3, updated_at = now()`, [key, JSON.stringify(input[field]), actor.id]);
+      }
+      await audit(c, actor, 'rider.programme', 'setting', 'rider.programme', input);
     });
+    return input;
   }
 
   // ---- the rider's own money ------------------------------------------------------------------------------------------
@@ -48,7 +76,11 @@ export class RiderMoneyService {
       const entries = (await c.query<{ id: number; kind: string; amount_cents: number; note: string; created_at: Date }>('SELECT id, kind, amount_cents, note, created_at FROM rider_ledger WHERE rider_id = $1 ORDER BY id DESC LIMIT 100', [rider.id])).rows;
       const payouts = (await c.query<{ id: string; payout_no: number; amount_cents: number; fee_cents: number; status: string; requested_at: Date; paid_at: Date | null }>(
         'SELECT id, payout_no, amount_cents, fee_cents, status, requested_at, paid_at FROM payouts WHERE rider_id = $1 ORDER BY requested_at DESC LIMIT 30', [rider.id])).rows;
+      const cash = (await c.query<{ id: string; kind: string; amount_cents: number; ref: string; created_at: Date }>('SELECT id, kind, amount_cents, ref, created_at FROM rider_cash WHERE rider_id = $1 ORDER BY id DESC LIMIT 60', [rider.id])).rows;
+      const how = (await programme(c)).cashInstructions;
       return {
+        cashInstructions: how,
+        cash: cash.map((e) => ({ id: String(e.id), kind: e.kind, amountCents: Number(e.amount_cents), ref: e.ref, at: e.created_at.toISOString() })),
         balanceCents: t.balance, todayCents: t.today, weekCents: t.week, cashHeldCents: t.cash, minWithdrawCents: s.minWithdrawCents, withdrawFeeCents: s.withdrawFeeCents,
         entries: entries.map((e) => ({ id: String(e.id), kind: e.kind, amountCents: e.amount_cents, note: e.note, at: e.created_at.toISOString() })),
         payouts: payouts.map((p) => ({ id: p.id, number: `PO-${p.payout_no}`, amountCents: p.amount_cents, feeCents: p.fee_cents, status: p.status, requestedAt: p.requested_at.toISOString(), paidAt: p.paid_at?.toISOString() ?? null })),
@@ -65,7 +97,7 @@ export class RiderMoneyService {
       if (amountCents < s.minWithdrawCents) throw new UnprocessableError('BELOW_MINIMUM', 'That’s below the minimum you can withdraw', { minCents: s.minWithdrawCents });
       const bal = Number((await c.query<{ b: number }>('SELECT COALESCE(sum(amount_cents),0)::bigint AS b FROM rider_ledger WHERE rider_id = $1', [rider.id])).rows[0]!.b);
       if (amountCents + s.withdrawFeeCents > bal) throw new UnprocessableError('INSUFFICIENT_BALANCE', 'You don’t have enough to withdraw that and cover the fee', { balanceCents: bal, feeCents: s.withdrawFeeCents });
-      await c.query('INSERT INTO payouts (id, rider_id, amount_cents, fee_cents, phone) VALUES ($1,$2,$3,$4,$5)', [id, rider.id, amountCents, s.withdrawFeeCents, rider.phone]);
+      await c.query('INSERT INTO payouts (id, rider_id, amount_cents, fee_cents, phone) VALUES ($1,$2,$3,$4,$5)', [id, rider.id, amountCents, s.withdrawFeeCents, (await c.query<{ p: string }>(`SELECT COALESCE(NULLIF(payout_phone, ''), phone) AS p FROM riders WHERE id = $1`, [rider.id])).rows[0]!.p]);
       await c.query(`INSERT INTO rider_ledger (rider_id, kind, amount_cents, payout_id, note) VALUES ($1,'payout',$2,$3,'Withdrawal requested')`, [rider.id, -amountCents, id]);
       if (s.withdrawFeeCents > 0) await c.query(`INSERT INTO rider_ledger (rider_id, kind, amount_cents, payout_id, note) VALUES ($1,'payout_fee',$2,$3,'Withdrawal fee')`, [rider.id, -s.withdrawFeeCents, id]);
     });
@@ -147,11 +179,14 @@ export class RiderMoneyService {
   }
 }
 
+export const kesText = (cents: number) => `KES ${Math.round(cents / 100).toLocaleString('en-US')}`;
+
 /** Settling a payout, shared by single payouts and payout batches. Runs inside the caller’s transaction. */
 export async function settlePayoutPaid(c: Queryable, id: string, providerRef: string, actor: Actor) {
-  const p = (await c.query<{ status: string }>('SELECT status FROM payouts WHERE id = $1 FOR UPDATE', [id])).rows[0];
+  const p = (await c.query<{ status: string; rider_id: string; amount_cents: number }>('SELECT status, rider_id, amount_cents FROM payouts WHERE id = $1 FOR UPDATE', [id])).rows[0];
   if (!p) throw new NotFoundError('Payout');
   if (p.status !== 'pending') throw new ConflictError('ALREADY_SETTLED', `This payout is already ${p.status}`);
+  await queuePush(c, { type: 'rider', id: p.rider_id }, 'payout_paid', { amount: kesText(p.amount_cents) });
   await c.query(`UPDATE payouts SET status = 'paid', paid_at = now(), paid_by = $2, provider_ref = $3 WHERE id = $1`, [id, actor.name ?? 'Staff', providerRef]);
   await audit(c, actor, 'payout.paid', 'payout', id, { providerRef });
 }
@@ -161,6 +196,7 @@ export async function settlePayoutFailed(c: Queryable, id: string, reason: strin
   if (p.status !== 'pending') throw new ConflictError('ALREADY_SETTLED', `This payout is already ${p.status}`);
   await c.query(`UPDATE payouts SET status = 'failed', failure_reason = $2 WHERE id = $1`, [id, reason]);
   await c.query(`INSERT INTO rider_ledger (rider_id, kind, amount_cents, payout_id, note, by_name) VALUES ($1,'payout_reversal',$2,$3,$4,$5)`, [p.rider_id, p.amount_cents + p.fee_cents, id, `Payout failed: ${reason}`, actor.name ?? 'Staff']);
+  await queuePush(c, { type: 'rider', id: p.rider_id }, 'payout_failed', { amount: kesText(p.amount_cents + p.fee_cents), reason });
   await audit(c, actor, 'payout.failed', 'payout', id, { reason });
 }
 

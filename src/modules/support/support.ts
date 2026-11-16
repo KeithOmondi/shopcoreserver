@@ -387,19 +387,21 @@ export class SupportService {
 
   // ---- help centre -------------------------------------------------------------------------------------------------------------------------
 
-  async articles(onlyLive: boolean, q?: string, category?: string) {
+  /** `scope` keeps rider articles (category starts with "Rider · ") apart from the shoppers' help centre. */
+  async articles(onlyLive: boolean, q?: string, category?: string, scope?: 'customer' | 'rider') {
     return this.db.read(async (c) => {
       const { rows } = await c.query<{ id: string; title: string; category: string; body: string; live: boolean; views: number; author: string; updated_at: Date }>(
         `SELECT id, title, category, body, live, views, author, updated_at FROM help_articles
           WHERE (NOT $1 OR live) AND ($2::text IS NULL OR category = $2) AND ($3::text IS NULL OR title ILIKE '%' || $3 || '%' OR body ILIKE '%' || $3 || '%')
-          ORDER BY category, title LIMIT 200`, [onlyLive, category ?? null, q ?? null]);
+            AND ($4::text IS NULL OR ($4 = 'rider') = (category LIKE 'Rider · %'))
+          ORDER BY category, title LIMIT 200`, [onlyLive, category ?? null, q ?? null, scope ?? null]);
       return rows.map((a) => ({ id: a.id, title: a.title, category: a.category, body: onlyLive && !q ? '' : a.body, live: a.live, views: a.views, author: a.author, updatedAt: a.updated_at.toISOString() }));
     });
   }
 
   /** Public help search. A search that finds nothing is remembered so the team can write that article. */
-  async search(q: string | undefined, category?: string) {
-    const items = await this.articles(true, q, category);
+  async search(q: string | undefined, category?: string, scope: 'customer' | 'rider' = 'customer') {
+    const items = await this.articles(true, q, category, scope);
     if (q && q.length >= 2 && items.length === 0) {
       await this.db.tx((c) => c.query(`INSERT INTO help_missed_searches (q) VALUES ($1) ON CONFLICT (q) DO UPDATE SET count = help_missed_searches.count + 1, last_at = now()`, [q.toLowerCase()])).catch(() => undefined);
     }

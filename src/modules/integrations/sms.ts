@@ -36,7 +36,33 @@ export class AfricasTalkingSms implements SmsSender {
   }
 }
 
+/** TalkSasa bulk SMS (REST API v3, bearer token). The address can be changed with TALKSASA_BASE_URL if TalkSasa moves it. */
+export class TalkSasaSms implements SmsSender {
+  constructor(
+    private readonly token: string,
+    private readonly senderId: string,
+    private readonly baseUrl: string,
+    private readonly log: Logger,
+    private readonly fetchFn: typeof fetch = fetch,
+  ) {}
+
+  async send(phone: string, text: string): Promise<void> {
+    const res = await this.fetchFn(`${this.baseUrl.replace(/\/$/, '')}/sms/send`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${this.token}`, accept: 'application/json', 'content-type': 'application/json' },
+      body: JSON.stringify({ recipient: phone.replace(/^\+/, ''), sender_id: this.senderId, type: 'plain', message: text }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    const j = (await res.json().catch(() => ({}))) as { status?: string; message?: string };
+    if (!res.ok || j.status === 'error') {
+      this.log.error({ status: res.status, reason: j.message }, 'SMS provider refused the request');
+      throw new Error(`The SMS provider answered ${res.status}${j.message ? ` (${j.message})` : ''}`);
+    }
+  }
+}
+
 export function makeSms(cfg: Config, log: Logger): SmsSender {
   if (cfg.SMS_PROVIDER === 'africastalking') return new AfricasTalkingSms(cfg.AT_USERNAME!, cfg.AT_API_KEY!, cfg.AT_SENDER_ID, log);
+  if (cfg.SMS_PROVIDER === 'talksasa') return new TalkSasaSms(cfg.TALKSASA_API_TOKEN!, cfg.TALKSASA_SENDER_ID!, cfg.TALKSASA_BASE_URL, log);
   return consoleSms(log);
 }

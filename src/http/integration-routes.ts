@@ -68,7 +68,11 @@ export function registerIntegrationRoutes(app: FastifyInstance, svc: Integration
   });
 
   app.get('/v1/files/:id', async (req, reply) => {
-    const f = await uploads.open(parse(IdParam, req.params).id, await ownerOf(req));
+    const id = parse(IdParam, req.params).id;
+    const owner = await ownerOf(req);
+    // A rider's papers are for staff who manage riders, not every staff member.
+    if (owner?.type === 'staff' && ['rider-document', 'delivery-photo'].includes((await uploads.kindOf(id)) ?? '') && !(await authz.staffContext(req)).can('Riders', 'View')) throw new ForbiddenError('You don’t have permission to open rider documents');
+    const f = await uploads.open(id, owner);
     return reply
       .header('content-type', f.contentType)
       .header('content-disposition', `inline; filename="${f.name.replace(/"/g, '')}"`)

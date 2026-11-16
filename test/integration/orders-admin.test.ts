@@ -104,6 +104,7 @@ describe('orders for staff', () => {
     expect(note.statusCode).toBe(200);
     const d = (await call('GET', `/v1/admin/orders/${paid.id}`, grace)).json();
     expect(d).toMatchObject({ number: paid.orderNumber, status: 'Processing', paymentMethod: 'card', customer: { name: 'Brian Kiptoo', phone: '+254 722 000 111' }, delivery: { area: 'Westlands', address: 'Waiyaki Way' } });
+    expect(d).toMatchObject({ canCancel: true, dispatch: null, packing: { stage: 'pick', picked: [], packedAt: null } });
     expect(d.items).toEqual([expect.objectContaining({ sku: 'TOTE-1', quantity: 1, lineTotalCents: 485_000 })]);
     expect(d.events.map((e: { kind: string }) => e.kind)).toEqual(['Placed', 'Paid', 'Note']);
     expect(d.notes[0]).toMatchObject({ by: 'Kevin', text: 'Customer asked for a gift bag' });

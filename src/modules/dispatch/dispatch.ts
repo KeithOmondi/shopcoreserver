@@ -8,6 +8,10 @@ import { decodeCursor, encodeCursor } from '../../http/pagination.js';
 import { audit, outbox, type Actor } from '../products/products.js';
 import { primaryLocation } from '../inventory/stock.js';
 import type { RiderContext } from './riders.js';
+import { rewardDelivered } from '../customers/rewards.js';
+import { queuePush } from '../integrations/push.js';
+import { kesText, programme } from './money.js';
+import type { SmsSender } from './riders.js';
 
 const uuid = z.string().refine(isUuid, 'must be a UUID');
 export const OFFER_SECONDS = 75;
@@ -19,6 +23,7 @@ export const INCIDENT_TYPES = ['Road accident', 'Vehicle issue', 'Customer confl
 
 export const AssignSchema = z.strictObject({ riderId: uuid, force: z.boolean().default(false), note: z.string().trim().max(200).default('') });
 export const DeclineSchema = z.strictObject({ reason: z.enum(DECLINE_REASONS).default('other') });
+export const RiderRatingSchema = z.strictObject({ stars: z.number().int().min(1).max(5), comment: z.string().trim().max(500).default('') });
 export const StageSchema = z.strictObject({ stage: z.enum(['at_pickup', 'picked_up', 'at_dropoff']) });
 export const DeliverSchema = z.strictObject({ code: z.string().regex(/^\d{4}$/), cashCents: z.number().int().min(0).optional(), photoRef: z.string().trim().max(300).optional() });
 export const FailSchema = z.strictObject({ reason: z.enum(FAILURE_REASONS), note: z.string().trim().max(300).default('') });
@@ -54,7 +59,7 @@ const deliveryView = (d: DeliveryRow) => ({
 });
 
 export class DispatchService {
-  constructor(private readonly db: Database) {}
+  constructor(private readonly db: Database, private readonly sms?: SmsSender) {}
 
   /** Offers nobody answered in time go back to the pool. Runs whenever the board or an offer list is read, and from the worker. */
   async expireOffers(c?: Queryable): Promise<number> {
@@ -131,6 +136,7 @@ export class DispatchService {
       await c.query(`INSERT INTO delivery_attempts (delivery_id, rider_id, outcome, reason) VALUES ($1,$2,$3,$4)`, [id, input.riderId, direct ? 'accepted' : 'offered', input.note]);
       await audit(c, actor, direct ? 'delivery.assign' : 'delivery.offer', 'order', orderId, { riderId: input.riderId, note: input.note });
       await outbox(c, 'order', orderId, direct ? 'DeliveryAssigned' : 'DeliveryOffered', { orderId, riderId: input.riderId, deliveryId: id });
+      await queuePush(c, { type: 'rider', id: input.riderId }, 'offer', { order: `SC-${o.order_no}`, amount: kesText(fare) }, { deliveryId: id, screen: 'home' });
     });
     return this.deliveryById(id);
   }
@@ -178,6 +184,7 @@ export class DispatchService {
       if (d.status !== 'offered' || d.expired) throw new UnprocessableError('OFFER_GONE', 'This request is no longer available');
       await c.query(`UPDATE deliveries SET status = 'accepted', accepted_at = now(), offer_expires_at = NULL, version = version + 1 WHERE id = $1`, [deliveryId]);
       await c.query(`INSERT INTO delivery_attempts (delivery_id, rider_id, outcome) VALUES ($1,$2,'accepted')`, [deliveryId, rider.id]);
+      await this.tellCustomer(c, d.order_id, 'order_accepted', rider.id);
     });
     return this.activeFor(rider);
   }
@@ -209,11 +216,21 @@ export class DispatchService {
     return d;
   }
 
+  /** Queues a phone notification for the shopper who placed the order (their own preferences decide whether it is sent). */
+  private async tellCustomer(c: Queryable, orderId: string, template: 'order_accepted' | 'order_on_the_way' | 'order_arrived' | 'order_delivered', riderId: string) {
+    const o = (await c.query<{ user_id: string; order_no: number; code: string | null; rider: string }>(
+      `SELECT o.user_id, o.order_no, (SELECT handover_code FROM deliveries WHERE order_id = o.id AND rider_id = $2 ORDER BY created_at DESC LIMIT 1) AS code, (SELECT name FROM riders WHERE id = $2) AS rider FROM orders o WHERE o.id = $1`, [orderId, riderId])).rows[0];
+    if (!o?.user_id) return;
+    await queuePush(c, { type: 'customer', id: o.user_id }, template, { order: `SC-${o.order_no}`, code: o.code ?? '', rider: (o.rider ?? 'Your rider').split(' ')[0]! }, { orderId, screen: 'order' });
+  }
+
   async stage(rider: RiderContext, id: string, stage: z.infer<typeof StageSchema>['stage']) {
     await this.db.tx(async (c) => {
       const d = await this.mine(c, rider, id);
       if (NEXT[d.status] !== stage) throw new UnprocessableError('WRONG_STAGE', 'That step isn’t next for this delivery');
       await c.query(`UPDATE deliveries SET status = $2, picked_up_at = CASE WHEN $2 = 'picked_up' THEN now() ELSE picked_up_at END, version = version + 1 WHERE id = $1`, [id, stage]);
+      if (stage === 'picked_up') await this.tellCustomer(c, d.order_id, 'order_on_the_way', rider.id);
+      if (stage === 'at_dropoff') await this.tellCustomer(c, d.order_id, 'order_arrived', rider.id);
     });
     return this.activeFor(rider);
   }
@@ -233,7 +250,18 @@ export class DispatchService {
         if (amount > 0) await c.query(`INSERT INTO rider_ledger (rider_id, kind, amount_cents, delivery_id, note) VALUES ($1,$2,$3,$4,$5)`, [rider.id, kind, amount, id, `SC-${o.order_no}`]);
       }
       if (d.cod_cents > 0) await c.query(`INSERT INTO rider_cash (rider_id, kind, amount_cents, delivery_id, ref) VALUES ($1,'collected',$2,$3,$4)`, [rider.id, d.cod_cents, id, `SC-${o.order_no}`]);
-      await c.query('UPDATE riders SET deliveries_done = deliveries_done + 1 WHERE id = $1', [rider.id]);
+      const me = (await c.query<{ deliveries_done: number; referred_by: string | null; referral_paid_at: Date | null; name: string }>('UPDATE riders SET deliveries_done = deliveries_done + 1 WHERE id = $1 RETURNING deliveries_done, referred_by, referral_paid_at, name', [rider.id])).rows[0]!;
+      // The rider who invited this one is paid once, when they reach the goal.
+      if (me.referred_by && !me.referral_paid_at) {
+        const prog = await programme(c);
+        if (me.deliveries_done >= prog.referralGoal && prog.referralRewardCents > 0) {
+          await c.query('UPDATE riders SET referral_paid_at = now() WHERE id = $1', [rider.id]);
+          await c.query(`INSERT INTO rider_ledger (rider_id, kind, amount_cents, note) VALUES ($1,'bonus',$2,$3)`, [me.referred_by, prog.referralRewardCents, `Referral bonus: ${me.name}`]);
+          await queuePush(c, { type: 'rider', id: me.referred_by }, 'referral', { name: me.name.split(' ')[0] ?? me.name, goal: String(prog.referralGoal), amount: kesText(prog.referralRewardCents) });
+        }
+      }
+      await this.tellCustomer(c, d.order_id, 'order_delivered', rider.id);
+      await rewardDelivered(c, d.order_id);
       await outbox(c, 'order', d.order_id, 'OrderDelivered', { orderId: d.order_id, riderId: rider.id, deliveryId: id });
     });
     return { delivered: true };
@@ -247,9 +275,23 @@ export class DispatchService {
     });
   }
 
-  async history_(rider: RiderContext) {
+  /** A shopper's star rating of the rider who delivered their order. One per order, once it has been delivered. */
+  async rateRider(userId: string, orderId: string, input: { stars: number; comment: string }) {
+    await this.db.tx(async (c) => {
+      const d = (await c.query<{ id: string; rider_id: string; user_id: string }>(
+        `SELECT d.id, d.rider_id, o.user_id FROM deliveries d JOIN orders o ON o.id = d.order_id WHERE d.order_id = $1 AND d.status = 'delivered' ORDER BY d.delivered_at DESC LIMIT 1`, [orderId])).rows[0];
+      if (!d || d.user_id !== userId) throw new NotFoundError('Delivered order');
+      await c.query('INSERT INTO rider_ratings (delivery_id, rider_id, customer_id, stars, comment) VALUES ($1,$2,$3,$4,$5)', [d.id, d.rider_id, userId, input.stars, input.comment])
+        .catch((e: { code?: string }) => { if (e.code === '23505') throw new ConflictError('ALREADY_RATED', 'You have already rated this rider'); throw e; });
+      await c.query('UPDATE riders SET rating = (SELECT round(avg(stars)::numeric, 2) FROM rider_ratings WHERE rider_id = $1) WHERE id = $1', [d.rider_id]);
+    });
+    return { rated: true };
+  }
+
+  /** Finished deliveries, newest first, 500 at a time. Pass the time of the oldest one you have to get the next page. */
+  async history_(rider: RiderContext, before?: string) {
     return this.db.read(async (c) => ({ items: (await c.query<DeliveryRow & { delivered_at: Date | null; failed_at: Date | null; failure_reason: string | null }>(
-      `${DELIVERY_SELECT.replace('d.assigned_by,', 'd.assigned_by, d.delivered_at, d.failed_at, d.failure_reason,')} WHERE d.rider_id = $1 AND d.status IN ('delivered','failed') ORDER BY COALESCE(d.delivered_at, d.failed_at) DESC LIMIT 100`, [rider.id])).rows
+      `${DELIVERY_SELECT.replace('d.assigned_by,', 'd.assigned_by, d.delivered_at, d.failed_at, d.failure_reason,')} WHERE d.rider_id = $1 AND d.status IN ('delivered','failed') AND ($2::timestamptz IS NULL OR COALESCE(d.delivered_at, d.failed_at) < $2) ORDER BY COALESCE(d.delivered_at, d.failed_at) DESC LIMIT 500`, [rider.id, before ?? null])).rows
       .map((d) => ({ ...deliveryView(d), deliveredAt: d.delivered_at?.toISOString() ?? null, failedAt: d.failed_at?.toISOString() ?? null, failureReason: d.failure_reason })) }));
   }
 
@@ -303,14 +345,23 @@ export class DispatchService {
 
   async report(rider: RiderContext, input: z.infer<typeof IncidentSchema>) {
     const id = uuidv7();
+    let alert: { phone: string; text: string } | null = null;
     await this.db.tx(async (c) => {
       const live = (await c.query<{ id: string }>(`SELECT id FROM deliveries WHERE rider_id = $1 AND status IN ${LIVE} LIMIT 1`, [rider.id])).rows[0];
       const r = (await c.query<{ last_lat: number | null; last_lng: number | null }>('SELECT last_lat, last_lng FROM riders WHERE id = $1', [rider.id])).rows[0]!;
       const sev = input.sos || input.type === 'Medical assistance' || input.type === 'Theft or robbery' ? 'critical' : input.type === 'Road accident' || input.type === 'Vehicle issue' ? 'high' : 'medium';
       await c.query('INSERT INTO incidents (id, rider_id, type, severity, sos, lat, lng, delivery_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)', [id, rider.id, input.type, sev, input.sos, input.lat ?? r.last_lat, input.lng ?? r.last_lng, live?.id ?? null]);
       await c.query('INSERT INTO incident_log (incident_id, body, by_name) VALUES ($1,$2,$3)', [id, `${input.type} reported${input.note ? `: ${input.note}` : ''}`, input.sos ? 'Rider app (SOS)' : rider.name]);
+      if (input.sos) {
+        const e = (await c.query<{ name: string; phone: string; emergency_name: string; emergency_phone: string }>('SELECT name, phone, emergency_name, emergency_phone FROM riders WHERE id = $1', [rider.id])).rows[0];
+        const lat = input.lat ?? r.last_lat, lng = input.lng ?? r.last_lng;
+        if (e?.emergency_phone) alert = { phone: e.emergency_phone, text: `ShopCore: ${e.name} pressed the emergency button and may need help.${lat !== null && lng !== null ? ` Last location: https://maps.google.com/?q=${lat},${lng}.` : ''} Please call them on ${e.phone}.` };
+      }
       await outbox(c, 'incident', id, input.sos ? 'RiderSos' : 'IncidentReported', { incidentId: id, riderId: rider.id, type: input.type });
     });
+    // The rider's emergency contact is texted straight away. A failed text never blocks the report itself.
+    const a = alert as { phone: string; text: string } | null;
+    if (a && this.sms) await this.sms.send(a.phone, a.text).catch(() => undefined);
     return { id };
   }
 

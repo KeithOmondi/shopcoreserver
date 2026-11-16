@@ -135,7 +135,7 @@ describe('tickets', () => {
   it('gives riders their own support line', async () => {
     await call('POST', '/v1/rider/auth/code', null, { phone: '+254711999001', purpose: 'signup' });
     await call('POST', '/v1/rider/auth/verify', null, { phone: '+254711999001', purpose: 'signup', code: '123456' });
-    const reg = (await call('POST', '/v1/rider/auth/register', null, { phone: '+254711999001', password: 'Ride1234', name: 'Wanjala Rider' })).json();
+    const reg = (await call('POST', '/v1/rider/auth/register', null, { phone: '+254711999001', password: 'Ride1234', kraPin: 'A123456789B', emergencyName: 'Next Kin', emergencyRelation: 'Sibling', emergencyPhone: '+254700000000', name: 'Wanjala Rider' })).json();
     const t = await call('POST', '/v1/rider/support/tickets', reg.accessToken, { subject: 'My payout is late', category: 'Payments', message: 'Requested on Monday.' });
     expect(t.statusCode).toBe(201);
     expect((await call('GET', '/v1/admin/tickets?kind=rider', grace)).json().items[0]).toMatchObject({ kind: 'rider', person: 'Wanjala Rider' });

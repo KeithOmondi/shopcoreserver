@@ -42,8 +42,14 @@ export class DiskStore implements FileStore {
   }
 }
 
+/** Pictures shown to every shopper. Everything else (rider papers, delivery and return photos, avatars) is private. */
+export const PUBLIC_KINDS: readonly UploadKind[] = ['banner', 'product-image'];
+
 export class UploadService {
-  constructor(private readonly db: Database, private readonly cfg: Config, private readonly store: FileStore = new DiskStore(cfg.UPLOAD_DIR)) {}
+  /** `store` holds private files. `publicStore` (a separate bucket) holds the shop's public pictures; without one they share `store`. */
+  constructor(private readonly db: Database, private readonly cfg: Config, private readonly store: FileStore = new DiskStore(cfg.UPLOAD_DIR), private readonly publicStore: FileStore = store) {}
+
+  private storeFor(kind: string) { return PUBLIC_KINDS.includes(kind as UploadKind) ? this.publicStore : this.store; }
 
   async save(owner: Owner, kind: UploadKind, contentType: string, name: string, bytes: Buffer) {
     const t = TYPES[contentType];
@@ -54,7 +60,7 @@ export class UploadService {
     if (!t.magic(bytes)) throw new UnprocessableError('FILE_CORRUPT', 'That doesn’t look like a real ' + t.ext.toUpperCase() + ' file');
     const id = uuidv7();
     const clean = name.replace(/[^\w .()-]/g, '').slice(0, 120) || `file.${t.ext}`;
-    await this.store.put(id, t.ext, bytes);
+    await this.storeFor(kind).put(id, t.ext, bytes);
     await this.db.tx((c) => c.query('INSERT INTO uploads (id, kind, owner_id, owner_type, content_type, size_bytes, sha256, file_name) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)', [id, kind, owner.id, owner.type, contentType, bytes.length, createHash('sha256').update(bytes).digest('hex'), clean]));
     return { id, url: `/v1/files/${id}`, kind, contentType, sizeBytes: bytes.length, name: clean };
   }
@@ -74,12 +80,18 @@ export class UploadService {
   }
 
   /** Banners are public; everything else is for the person who sent it and for staff. */
+  /** What kind of file this is (so the route can check the right permission before opening it). */
+  async kindOf(id: string): Promise<string | null> {
+    if (!isUuid(id)) return null;
+    return (await this.db.read((c) => c.query<{ kind: string }>('SELECT kind FROM uploads WHERE id = $1', [id]))).rows[0]?.kind ?? null;
+  }
+
   async open(id: string, who: Owner | null) {
     if (!isUuid(id)) throw new NotFoundError('File');
     const r = (await this.db.read((c) => c.query<{ kind: string; owner_id: string; owner_type: string; content_type: string; file_name: string }>('SELECT kind, owner_id, owner_type, content_type, file_name FROM uploads WHERE id = $1', [id]))).rows[0];
     if (!r) throw new NotFoundError('File');
     const isPublic = r.kind === 'banner' || r.kind === 'product-image';
     if (!isPublic && !(who && (who.type === 'staff' || who.type === 'service' || (who.id === r.owner_id && who.type === r.owner_type)))) throw new ForbiddenError('That file isn’t yours to open');
-    return { bytes: await this.store.get(id, TYPES[r.content_type]!.ext), contentType: r.content_type, name: r.file_name, public: isPublic };
+    return { bytes: await this.storeFor(r.kind).get(id, TYPES[r.content_type]!.ext), contentType: r.content_type, name: r.file_name, public: isPublic };
   }
 }

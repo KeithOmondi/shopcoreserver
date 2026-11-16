@@ -250,3 +250,25 @@ are checked against the live session on these routes, so signing out or deleting
 
 **Shop catalogue (public).** `GET /v1/storefront/catalogue` returns the categories (with sub-categories), brands and every buyable product in one call: picture links (`/v1/files/:id`), the price right now
 (a live flash sale included, with `listPriceCents` beside it), `inStock`, `isNew`, and a rating that is the average of shoppers' reviews of orders containing the product. Attach pictures with `PUT /v1/admin/products/:id/images {uploadIds}` (uploaded as kind `product-image`).
+
+## Shopper account: addresses, preferences, profile
+
+`GET /v1/delivery/areas` (public) returns `{counties: [{county, areas: [{name, zone, feeCents}]}], baseFeeCents, minBasketCents}`: the only places an address can be saved for. Zones now carry a `county` (default Nairobi; `POST/PATCH /v1/admin/zones` accept it).
+**Addresses** (`/v1/customer/addresses`: GET, POST, PATCH `/:id`, DELETE `/:id`): `{label: Home|Work|Other, fullName, phone, county, area, street, isDefault}`. `422 AREA_NOT_SERVED` if the county and area aren't on the list; the area is stored with the shop's own spelling so fees match exactly.
+The first address is the default; there is always at most one; deleting it promotes the oldest left; ten at most; each is visible only to its owner. Use the saved `county`/`area` as `delivery.area` when ordering.
+**Preferences** (`GET/PATCH /v1/customer/preferences`): topics `orders, returns` (on by default) and `deals, stock, recs` (off until asked), plus channels `push, email, sms` (the marketing consent, off until asked).
+**Profile:** `PATCH /v1/customer/me {fullName?, email?, dob?: {day, month, year} | null}`; a new phone number needs `POST /v1/customer/me/phone {phone}` (a code goes to the new number) then `POST /v1/customer/me/phone/verify {code}`; the old number stays in use until then.
+
+## Checkout (customer app)
+
+`POST /v1/coupons/quote {items, area, couponCode?}` prices a basket as checkout will charge it and returns `issues` (item gone, out of stock / only N left, below the delivery minimum, area not served) and `canOrder`, instead of failing; a bad coupon is `422 COUPON_INVALID` with a readable reason.
+`POST /v1/orders` (Idempotency-Key required) returns the order with `orderNumber`, `subtotalCents`, `deliveryFeeCents`, `discountCents`, `paymentMethod`, `paidAt` and `delivery`. Pay-on-delivery orders are `PAID` at once; M-Pesa orders are `PENDING_PAYMENT` until Safaricom confirms (see M-Pesa above).
+In development with `MPESA_ENV=simulator`, `npm run mpesa:simulate` (optionally `-- SC-123`, `-- latest fail`, `-- latest wrong`) plays Safaricom's part for the waiting prompt.
+
+## Shopper orders and tracking (customer app)
+
+`GET /v1/customer/orders?tab=active|completed|cancelled&limit&cursor` and `GET /v1/customer/orders/:id` (customer token; another person's order is a 404) return orders in the app's words:
+`status` is `processing | in_transit | delivered | cancelled` (in transit = the rider has picked it up), with `paid`, `awaitingPayment`, `cashDueCents` (cash orders), `canCancel`, `canTrack`, the price `totals`, `items`, `delivery`, and a `tracking` block:
+`steps` (placed, payment confirmed / order confirmed, packed, on the way, delivered: each with the time it really happened and a `done | current | todo` state; a cancelled order ends in a `cancelled` step with the reason), `rider` (once assigned),
+`handoverCode` and `riderLocation` (**only while the parcel is on the road**), and `failure` (the reason, if a delivery failed). The app polls the single-order call every 10 s while an order is moving.
+A shopper can cancel with `POST /v1/orders/:id/cancel {reason}` until the parcel is on the road; after that it's `422 ORDER_ON_THE_WAY`. Staff cancellations aren't blocked. Cancelling a paid online order queues a refund event; **the money is returned by finance**, since automatic M-Pesa reversals aren't connected yet.

@@ -64,7 +64,7 @@ async function main() {
       const p = await catalog.createProduct({
         sku: `SC-${cat.slice(0, 3).toUpperCase()}-${100 + n}`, name, description: `${name}. Quality materials, made to last, delivered across Nairobi.`, priceCents: price * 100, currency: 'KES',
         categoryId: cats[cat]!, subcategory: sub, brandId: brands[cat]!, supplierId: sups[cat]!, costCents: Math.round((price * 0.58) / 10) * 10 * 100, barcode: ean13(n * 7919 + 1),
-        tax: 'standard', trackStock: true, status, reorderAt: 10, handle: '', seoTitle: '', seoDesc: '', variants: [], initialStock: 0,
+        tax: 'standard', trackStock: true, status, reorderAt: 10, handle: '', seoTitle: '', seoDesc: '', variants: [], specs: {}, options: {}, initialStock: 0,
       }, actor);
       if (stock > 0) {
         let left = stock;

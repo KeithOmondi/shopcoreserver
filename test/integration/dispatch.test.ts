@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { createHarness, idemKey, resetDatabase, type Harness } from '../helpers.js';
 import { uuidv7 } from '../../src/infra/uuid.js';
 
@@ -21,11 +21,11 @@ let product: string;
 async function newRider(phone: string, name: string, opts: { approve?: boolean } = {}) {
   expect((await call('POST', '/v1/rider/auth/code', null, { phone, purpose: 'signup' })).statusCode).toBe(204);
   expect((await call('POST', '/v1/rider/auth/verify', null, { phone, purpose: 'signup', code: '123456' })).statusCode).toBe(204);
-  const reg = await call('POST', '/v1/rider/auth/register', null, { phone, password: 'Ride1234', name, vehicle: 'Motorbike', plate: 'KDA 284G', zoneId: zoneKilimani });
+  const reg = await call('POST', '/v1/rider/auth/register', null, { phone, password: 'Ride1234', kraPin: 'A123456789B', emergencyName: 'Next Kin', emergencyRelation: 'Sibling', emergencyPhone: '+254700000000', name, vehicle: 'Motorbike', plate: 'KDA 284G', zoneId: zoneKilimani });
   expect(reg.statusCode).toBe(201);
   const t = reg.json() as { accessToken: string; refreshToken: string; account: { id: string } };
   if (opts.approve !== false) {
-    for (const key of ['id', 'license', 'insurance', 'photo', 'selfie']) await call('PUT', `/v1/admin/riders/${t.account.id}/documents/${key}`, james, { state: 'valid' });
+    for (const key of ['id', 'license', 'insurance', 'logbook', 'photo', 'selfie', 'kra', 'conduct']) await call('PUT', `/v1/admin/riders/${t.account.id}/documents/${key}`, james, { state: 'valid' });
     const ok = await call('POST', `/v1/admin/riders/${t.account.id}/actions`, james, { action: 'approve' });
     expect(ok.statusCode).toBe(200);
     await new Promise((r) => setTimeout(r, 0));
@@ -62,7 +62,7 @@ async function expectInvariant() {
 
 beforeAll(async () => {
   await resetDatabase();
-  h = await createHarness({ RIDER_DEV_OTP: '123456' });
+  h = await createHarness({ RIDER_DEV_OTP: '123456', CUSTOMER_DEV_OTP: '482913' });
   const s = h.c.staff;
   await s.ensureDefaultRoles();
   const add = (n: string, e: string, r: string) => s.insertRaw({ name: n, email: e, role: r, status: 'active', password: PW, mustChange: false });
@@ -106,6 +106,34 @@ describe('zones and delivery fees', () => {
   });
 });
 
+describe('app status', () => {
+  it('lets the apps ask whether the shop is closed, and only settings staff change it', async () => {
+    expect((await call('GET', '/v1/app/status', null)).json()).toMatchObject({ maintenance: false, minVersion: '1.0.0' });
+    const body = { maintenance: true, message: 'Back soon', returnAt: '2030-01-01T10:00:00.000Z', minVersion: '1.2.0', latestVersion: '1.3.0' };
+    expect((await call('PUT', '/v1/admin/app-status', james, body)).statusCode).toBe(403);
+    expect((await call('PUT', '/v1/admin/app-status', owner, { ...body, minVersion: 'old' })).statusCode).toBe(400);
+    expect((await call('PUT', '/v1/admin/app-status', owner, body)).json()).toMatchObject(body);
+    expect((await call('GET', '/v1/app/status', null)).json()).toMatchObject(body);
+    await call('PUT', '/v1/admin/app-status', owner, { maintenance: false });
+  });
+});
+
+describe('business profile and system status', () => {
+  it('keeps the business details, and shows what is connected without any secrets', async () => {
+    expect((await call('GET', '/v1/admin/business-profile', owner)).json()).toMatchObject({ name: 'ShopCore' });
+    expect((await call('PUT', '/v1/admin/business-profile', james, { name: 'Acme Ltd' })).statusCode).toBe(403);
+    expect((await call('PUT', '/v1/admin/business-profile', owner, { name: 'Acme Ltd', kraPin: 'bad' })).statusCode).toBe(400);
+    const ok = await call('PUT', '/v1/admin/business-profile', owner, { name: 'Acme Ltd', email: 'Hello@Acme.co', kraPin: 'p051234567x', address: 'Nairobi' });
+    expect(ok.json()).toMatchObject({ name: 'Acme Ltd', email: 'hello@acme.co', kraPin: 'P051234567X' });
+    expect((await call('GET', '/v1/admin/business-profile', owner)).json().name).toBe('Acme Ltd');
+    const st = await call('GET', '/v1/admin/system/status', owner);
+    expect(st.statusCode).toBe(200);
+    expect(st.json()).toMatchObject({ health: { postgres: 'ok' }, integrations: { payouts: { connected: false }, mpesa: { mode: expect.any(String) } } });
+    expect(JSON.stringify(st.json())).not.toMatch(/secret|password|key/i);
+    expect((await call('GET', '/v1/admin/system/status', null)).statusCode).toBe(401);
+  });
+});
+
 describe('cash on delivery', () => {
   it('confirms at once: stock leaves the shelf, nothing is taken until the rider collects', async () => {
     const before = Number((await h.db.query('SELECT COALESCE(sum(on_hand),0) AS n FROM stock_levels')).rows[0].n);
@@ -131,15 +159,18 @@ describe('rider sign-up and approval', () => {
   let rider: { id: string; token: string };
 
   it('needs a verified phone and a good code', async () => {
-    expect((await call('POST', '/v1/rider/auth/register', null, { phone, password: 'Ride1234', name: 'New Rider' })).json().error.code).toBe('CODE_NOT_VERIFIED');
+    expect((await call('POST', '/v1/rider/auth/register', null, { phone, password: 'Ride1234', kraPin: 'A123456789B', emergencyName: 'Next Kin', emergencyRelation: 'Sibling', emergencyPhone: '+254700000000', name: 'New Rider' })).json().error.code).toBe('CODE_NOT_VERIFIED');
     await call('POST', '/v1/rider/auth/code', null, { phone: '0700 111 222', purpose: 'signup' });
     expect((await call('POST', '/v1/rider/auth/verify', null, { phone, purpose: 'signup', code: '999999' })).json().error.code).toBe('WRONG_CODE');
     expect((await call('POST', '/v1/rider/auth/code', null, { phone, purpose: 'signup' })).json().error.code).toBe('CODE_TOO_SOON');
     expect((await call('POST', '/v1/rider/auth/verify', null, { phone, purpose: 'signup', code: '123456' })).statusCode).toBe(204);
     expect((await call('POST', '/v1/rider/auth/register', null, { phone, password: 'short', name: 'New Rider' })).statusCode).toBe(400);
-    const reg = await call('POST', '/v1/rider/auth/register', null, { phone, password: 'Ride1234', name: 'New Rider', vehicle: 'Motorbike', plate: 'kda 111a' });
+    const reg = await call('POST', '/v1/rider/auth/register', null, { phone, password: 'Ride1234', kraPin: 'A123456789B', emergencyName: 'Next Kin', emergencyRelation: 'Sibling', emergencyPhone: '+254700000000', name: 'New Rider', email: 'New@Rider.test', payoutPhone: '0711 222 333', vehicle: 'Motorbike', plate: 'kda 111a' });
     expect(reg.statusCode).toBe(201);
-    expect(reg.json().account).toMatchObject({ status: 'pending', name: 'New Rider', plate: 'KDA 111A' });
+    expect(reg.json().account).toMatchObject({ status: 'pending', name: 'New Rider', plate: 'KDA 111A', email: 'new@rider.test', payoutPhone: '+254711222333', payoutName: 'New Rider' });
+    expect(reg.json().account.documents.map((d: { key: string }) => d.key)).toEqual(['id', 'license', 'insurance', 'logbook', 'photo', 'selfie', 'kra', 'conduct']);
+    expect(reg.json().account).toMatchObject({ kraPin: 'A123456789B', emergencyName: 'Next Kin', emergencyPhone: '+254700000000' });
+    expect(reg.json().account.documents[0]).toMatchObject({ key: 'id', uploaded: false });
     rider = { id: reg.json().account.id, token: reg.json().accessToken };
     expect((await call('POST', '/v1/rider/auth/code', null, { phone, purpose: 'signup' })).json().error.code).toBe('PHONE_EXISTS');
   });
@@ -149,7 +180,7 @@ describe('rider sign-up and approval', () => {
     expect((await call('GET', '/v1/rider/me', rider.token)).json()).toMatchObject({ status: 'pending' });
     expect((await call('PUT', '/v1/rider/availability', rider.token, { online: true })).statusCode).toBe(403);
     expect((await call('POST', `/v1/admin/riders/${rider.id}/actions`, james, { action: 'approve' })).json().error.code).toBe('DOCS_NOT_VERIFIED');
-    for (const key of ['id', 'license', 'insurance', 'photo']) await call('PUT', `/v1/admin/riders/${rider.id}/documents/${key}`, james, { state: 'valid' });
+    for (const key of ['id', 'license', 'insurance', 'logbook', 'photo', 'kra', 'conduct']) await call('PUT', `/v1/admin/riders/${rider.id}/documents/${key}`, james, { state: 'valid' });
     expect((await call('POST', `/v1/admin/riders/${rider.id}/actions`, james, { action: 'approve' })).json().error.message).toContain('Selfie check');
   });
 
@@ -207,6 +238,7 @@ describe('a delivery from offer to payout', () => {
     expect(a.statusCode).toBe(200);
     expect(a.json()).toMatchObject({ status: 'offered', rider: 'Wanjala Rider', fareCents: 20_000 });
     deliveryId = a.json().id;
+    expect((await call('GET', `/v1/admin/orders/${orderId}`, james)).json().dispatch).toMatchObject({ deliveryId, status: 'offered', riderName: 'Wanjala Rider' });
     expect((await board()).unassigned.map((x) => x.orderId)).not.toContain(orderId);
     expect((await call('POST', `/v1/admin/dispatch/orders/${orderId}/assign`, james, { riderId: rider.id })).json().error.code).toBe('ALREADY_ASSIGNED');
   });
@@ -260,7 +292,10 @@ describe('a delivery from offer to payout', () => {
     expect((await call('POST', `/v1/rider/deliveries/${act.id}/deliver`, rider.token, { code })).json().error.code).toBe('CASH_MISMATCH');
     expect((await call('POST', `/v1/rider/deliveries/${act.id}/deliver`, rider.token, { code, cashCents: 510_000 })).statusCode).toBe(200);
     expect((await call('GET', `/v1/admin/orders/${o.order.id}`, james)).json()).toMatchObject({ paid: true, cashDueCents: 0, status: 'Delivered' });
-    expect((await call('GET', '/v1/rider/earnings', rider.token)).json().cashHeldCents).toBe(510_000);
+    const cashView = (await call('GET', '/v1/rider/earnings', rider.token)).json();
+    expect(cashView.cashHeldCents).toBe(510_000);
+    expect(cashView.cash[0]).toMatchObject({ kind: 'collected', amountCents: 510_000 });
+    expect(typeof cashView.cashInstructions).toBe('string');
 
     const cash = (await call('GET', '/v1/admin/cash', samuel)).json();
     expect(cash.owed).toEqual([expect.objectContaining({ riderId: rider.id, heldCents: 510_000 })]);
@@ -373,8 +408,14 @@ describe('failed deliveries and incidents', () => {
   });
 
   it('turns a rider’s SOS into a critical incident dispatch can work', async () => {
+    const texts: { phone: string; text: string }[] = [];
+    const spy = vi.spyOn(h.c.sms, 'send').mockImplementation(async (phone, text) => { texts.push({ phone, text }); });
     const r = await call('POST', '/v1/rider/incidents', rider.token, { type: 'Road accident', sos: true, note: 'Hit by a matatu', lat: -1.28, lng: 36.81 });
+    spy.mockRestore();
     expect(r.statusCode).toBe(201);
+    expect(texts).toHaveLength(1);
+    expect(texts[0]).toMatchObject({ phone: '+254700000000' });
+    expect(texts[0]!.text).toContain('maps.google.com/?q=-1.28,36.81');
     const list = (await call('GET', '/v1/admin/incidents', james)).json().items as { id: string; number: string; severity: string; status: string; sos: boolean }[];
     expect(list[0]).toMatchObject({ severity: 'critical', status: 'open', sos: true });
     expect(list[0]!.number).toMatch(/^SOS-/);
@@ -397,9 +438,214 @@ describe('rosters', () => {
     const list = (await call('GET', `/v1/admin/shifts?from=${day}&to=${day}`, faith)).json().items as { window: string }[];
     expect(list).toHaveLength(1);
     expect(list[0]!.window).toBe('2 PM – 10 PM');
+    // The rider sees only their own shifts (today and the next two weeks).
+    const today = new Date().toISOString().slice(0, 10);
+    await call('PUT', '/v1/admin/shifts', faith, { riderId: r.id, day: today, window: '8 AM – 4 PM', zoneId: null });
+    const mine = (await call('GET', '/v1/rider/shifts', r.token)).json().items as { day: string; window: string }[];
+    expect(mine.map((x) => x.window)).toEqual(['8 AM – 4 PM']);
+    await call('DELETE', `/v1/admin/shifts?riderId=${r.id}&day=${today}`, faith);
     const pend = await newRider('+254744000002', 'Not Yet', { approve: false });
     expect((await call('PUT', '/v1/admin/shifts', faith, { riderId: pend.id, day, window: 'x' })).json().error.code).toBe('NOT_APPROVED');
     expect((await call('DELETE', `/v1/admin/shifts?riderId=${r.id}&day=${day}`, faith)).statusCode).toBe(204);
     expect((await call('GET', `/v1/admin/shifts?from=${day}&to=${day}`, faith)).json().items).toHaveLength(0);
+  });
+});
+
+describe('rider papers', () => {
+  it('asks a motor rider for every paper, a bicycle rider for fewer, and insists on expiry dates', async () => {
+    const phone = '+254745000001';
+    await call('POST', '/v1/rider/auth/code', null, { phone, purpose: 'signup' });
+    await call('POST', '/v1/rider/auth/verify', null, { phone, purpose: 'signup', code: '123456' });
+    const base = { phone, password: 'Ride1234', name: 'Pedal Rider', vehicle: 'Bicycle', kraPin: 'A123456789B', emergencyName: 'Next Kin', emergencyRelation: 'Sibling', emergencyPhone: '+254700000000' };
+    expect((await call('POST', '/v1/rider/auth/register', null, { ...base, kraPin: '123' })).statusCode).toBe(400);
+    expect((await call('POST', '/v1/rider/auth/register', null, { ...base, emergencyName: undefined })).statusCode).toBe(400);
+    const reg = await call('POST', '/v1/rider/auth/register', null, base);
+    expect(reg.statusCode).toBe(201);
+    expect(reg.json().account.documents.map((d: { key: string }) => d.key)).toEqual(['id', 'photo', 'selfie', 'kra', 'conduct']);
+    const token = reg.json().accessToken as string;
+    // a motor paper needs an expiry date that is still ahead
+    expect((await call('PUT', '/v1/rider/me/documents/insurance', token, { fileRef: 'x' })).statusCode).toBe(400);
+    expect((await call('PUT', '/v1/rider/me/documents/license', token, { fileRef: 'x', expiresOn: '2020-01-01' })).statusCode).toBe(400);
+    const ok = await call('PUT', '/v1/rider/me/documents/kra', token, { fileRef: 'abc' });
+    expect(ok.statusCode).toBe(200);
+    expect(ok.json().documents.find((d: { key: string }) => d.key === 'kra')).toMatchObject({ uploaded: true, state: 'pending' });
+    // contact details the rider can change themselves
+    const det = await call('PUT', '/v1/rider/me/details', token, { email: 'Pedal@Rider.test', emergencyName: 'Grace W', emergencyRelation: 'Sister', emergencyPhone: '0722 111 555' });
+    expect(det.json()).toMatchObject({ email: 'pedal@rider.test', emergencyName: 'Grace W', emergencyPhone: '+254722111555' });
+    // rider help articles stay out of the shoppers' help centre, and the other way round
+    for (const category of ['Rider · Deliveries', 'Orders']) await h.db.query(`INSERT INTO help_articles (id, title, category, body, live) VALUES ($1,$2,$3,'x',true)`, [uuidv7(), `Help ${category}`, category]);
+    const riderHelp = (await call('GET', '/v1/rider/help/articles', token)).json().items as { category: string }[];
+    expect(riderHelp.length).toBeGreaterThan(0);
+    expect(riderHelp.every((a) => a.category.startsWith('Rider · '))).toBe(true);
+    const shopperHelp = (await call('GET', '/v1/help/articles', null)).json().items as { category: string }[];
+    expect(shopperHelp.some((a) => a.category.startsWith('Rider · '))).toBe(false);
+    // changing where the money goes needs the password again
+    expect((await call('PUT', '/v1/rider/me/payout', token, { payoutPhone: '0711 000 111', payoutName: 'Pedal Rider', password: 'wrong' })).json().error.code).toBe('WRONG_PASSWORD');
+    const moved = await call('PUT', '/v1/rider/me/payout', token, { payoutPhone: '0711 000 111', payoutName: 'Pedal Rider', password: 'Ride1234' });
+    expect(moved.json()).toMatchObject({ payoutPhone: '+254711000111', payoutName: 'Pedal Rider' });
+  });
+});
+
+describe('rider papers: access and early renewal', () => {
+  it('lets only staff who manage riders open a rider’s papers', async () => {
+    const r = await newRider('+254746000050', 'Papers Rider');
+    const jpeg = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(64, 7)]);
+    const up = await h.app.inject({ method: 'PUT', url: '/v1/uploads?kind=rider-document&name=id.jpg', headers: { authorization: 'Bearer ' + r.token, 'content-type': 'image/jpeg' }, payload: jpeg });
+    expect(up.statusCode).toBe(201);
+    const id = up.json().id as string;
+    const open = (t: string) => h.app.inject({ method: 'GET', url: '/v1/files/' + id, headers: { authorization: 'Bearer ' + t } });
+    expect((await open(r.token)).statusCode).toBe(200);
+    expect((await open(faith)).statusCode).toBe(200);
+    expect((await open(kevin)).statusCode).toBe(403);
+    expect((await open(grace)).statusCode).toBe(403);
+  });
+
+  it('keeps a rider working on a still-valid paper while its renewal waits for review', async () => {
+    const r = await newRider('+254746000051', 'Renewal Rider');
+    const future = new Date(Date.now() + 200 * 864e5).toISOString().slice(0, 10);
+    await call('PUT', '/v1/admin/riders/' + r.id + '/documents/insurance', james, { state: 'valid', expiresOn: future });
+    const renew = await call('PUT', '/v1/rider/me/documents/insurance', r.token, { fileRef: 'new', expiresOn: new Date(Date.now() + 400 * 864e5).toISOString().slice(0, 10) });
+    expect(renew.json().documents.find((d: { key: string }) => d.key === 'insurance').state).toBe('pending');
+    expect((await goOnline(r)).statusCode).toBe(200);
+    // once staff turn the new one down, it blocks again
+    await call('PUT', '/v1/admin/riders/' + r.id + '/documents/insurance', james, { state: 'rejected', note: 'Blurry' });
+    expect((await goOnline(r)).json().error.code).toBe('DOCS_NOT_VALID');
+    // a paper that was never valid doesn't get the grace
+    await call('PUT', '/v1/rider/me/documents/insurance', r.token, { fileRef: 'again', expiresOn: future });
+    expect((await goOnline(r)).json().error.code).toBe('DOCS_NOT_VALID');
+  });
+});
+
+describe('the rider programme: referrals, ratings, training and notifications', () => {
+  /** Takes one paid order from a new request to delivered by this rider. Returns what the customer needs to rate it. */
+  async function deliverOne(r: { id: string; token: string }) {
+    const o = await placeOrder({});
+    const a = await call('POST', `/v1/admin/dispatch/orders/${o.order.id}/assign`, james, { riderId: r.id, force: true });
+    const id = a.json().id as string;
+    await call('POST', `/v1/rider/deliveries/${id}/stage`, r.token, { stage: 'at_pickup' });
+    await call('POST', `/v1/rider/deliveries/${id}/stage`, r.token, { stage: 'picked_up' });
+    await call('POST', `/v1/rider/deliveries/${id}/stage`, r.token, { stage: 'at_dropoff' });
+    const code = (await h.app.inject({ method: 'GET', url: `/v1/orders/${o.order.id}/delivery`, headers: { authorization: `Bearer ${o.customer}` } })).json().handoverCode as string;
+    expect((await call('POST', `/v1/rider/deliveries/${id}/deliver`, r.token, { code })).statusCode).toBe(200);
+    return { orderId: o.order.id, customer: o.customer };
+  }
+  const rate = (orderId: string, token: string, stars: number, comment = '') => h.app.inject({ method: 'POST', url: `/v1/orders/${orderId}/rider-rating`, headers: { authorization: `Bearer ${token}` }, payload: { stars, comment } });
+  const drain = async () => { for (let i = 0; i < 5; i++) if ((await h.c.push.drain()) === 0) break; };
+
+  it('pays the rider who invited another once the new rider reaches the goal', async () => {
+    const inviter = await newRider('+254746000001', 'Inviter Rider');
+    const code = (await call('GET', '/v1/rider/referral', inviter.token)).json().code as string;
+    expect(code).toMatch(/^[A-Z2-9]{8}$/);
+    // a small goal keeps the test quick
+    await call('PUT', '/v1/admin/rider-programme', owner, { minWithdrawCents: 10_000, withdrawFeeCents: 1_500, referralRewardCents: 50_000, referralGoal: 2, cashInstructions: 'Bring cash to the Westlands hub.' });
+    expect((await call('GET', '/v1/admin/rider-programme', owner)).json()).toMatchObject({ referralGoal: 2, cashInstructions: 'Bring cash to the Westlands hub.' });
+
+    const phone = '+254746000002';
+    await call('POST', '/v1/rider/auth/code', null, { phone, purpose: 'signup' });
+    await call('POST', '/v1/rider/auth/verify', null, { phone, purpose: 'signup', code: '123456' });
+    const base = { phone, password: 'Ride1234', name: 'Invited Rider', vehicle: 'Motorbike', plate: 'KDA 111B', kraPin: 'A123456789B', emergencyName: 'Next Kin', emergencyRelation: 'Sibling', emergencyPhone: '+254700000000' };
+    expect((await call('POST', '/v1/rider/auth/register', null, { ...base, referralCode: 'NOSUCH12' })).statusCode).toBe(400);
+    const reg = await call('POST', '/v1/rider/auth/register', null, { ...base, referralCode: code.toLowerCase() });
+    expect(reg.statusCode).toBe(201);
+    const invited = { id: reg.json().account.id as string, token: reg.json().accessToken as string };
+    for (const key of ['id', 'license', 'insurance', 'logbook', 'photo', 'selfie', 'kra', 'conduct']) await call('PUT', `/v1/admin/riders/${invited.id}/documents/${key}`, james, { state: 'valid' });
+    await call('POST', `/v1/admin/riders/${invited.id}/actions`, james, { action: 'approve' });
+    h.c.riders.invalidate();
+
+    await deliverOne(invited);
+    let ref = (await call('GET', '/v1/rider/referral', inviter.token)).json();
+    expect(ref.items[0]).toMatchObject({ name: 'Invited Rider', deliveries: 1, paid: false });
+    const before = (await call('GET', '/v1/rider/earnings', inviter.token)).json().balanceCents as number;
+    await deliverOne(invited);
+    ref = (await call('GET', '/v1/rider/referral', inviter.token)).json();
+    expect(ref.items[0]).toMatchObject({ deliveries: 2, paid: true });
+    expect(ref.earnedCents).toBe(50_000);
+    expect((await call('GET', '/v1/rider/earnings', inviter.token)).json().balanceCents).toBe(before + 50_000);
+    // only once
+    await deliverOne(invited);
+    expect((await call('GET', '/v1/rider/earnings', inviter.token)).json().balanceCents).toBe(before + 50_000);
+  });
+
+  it('lets a shopper rate the rider once, and keeps the rider’s average', async () => {
+    const r = await newRider('+254746000010', 'Rated Rider');
+    const a = await deliverOne(r);
+    expect((await rate(a.orderId, a.customer, 0)).statusCode).toBe(400);
+    const stranger = await h.token(uuidv7(), ['customer']);
+    expect((await rate(a.orderId, stranger, 5)).statusCode).toBe(404);
+    expect((await rate(a.orderId, a.customer, 5, 'Very polite')).statusCode).toBe(200);
+    expect((await rate(a.orderId, a.customer, 4)).json().error.code).toBe('ALREADY_RATED');
+    const b = await deliverOne(r);
+    expect((await rate(b.orderId, b.customer, 4)).statusCode).toBe(200);
+    const list = (await call('GET', '/v1/rider/ratings', r.token)).json();
+    expect(list).toMatchObject({ average: 4.5, count: 2, fiveStarStreak: 0 });
+    expect(list.items.map((i: { stars: number }) => i.stars)).toEqual([4, 5]);
+    expect((await call('GET', '/v1/rider/me', r.token)).json().rating).toBe(4.5);
+  });
+
+  it('tells the shopper how their order is going, if they have switched notifications on', async () => {
+    const r = await newRider('+254746000040', 'Courier Rider');
+    await h.app.inject({ method: 'POST', url: '/v1/customer/auth/signup', payload: { fullName: 'Push Shopper', email: 'push.shopper@example.com', phone: '+254712000777', password: 'sunrise2025' } });
+    const joined = (await h.app.inject({ method: 'POST', url: '/v1/customer/auth/verify-signup', payload: { phone: '+254712000777', code: '482913' } })).json() as { accessToken: string };
+    const o = { ...(await placeOrder({ userId: (JSON.parse(Buffer.from(joined.accessToken.split('.')[1]!, 'base64url').toString()) as { sub: string }).sub })), customer: joined.accessToken };
+    const tok = 'ExponentPushToken[customer123456]';
+    expect((await h.app.inject({ method: 'POST', url: '/v1/customer/push-token', headers: { authorization: 'Bearer ' + o.customer }, payload: { token: tok } })).statusCode).toBe(204);
+    h.c.push.sent.length = 0;
+    // push is off until the shopper opts in
+    const a = await call('POST', '/v1/admin/dispatch/orders/' + o.order.id + '/assign', james, { riderId: r.id, force: true });
+    const id = a.json().id as string;
+    await call('POST', '/v1/rider/deliveries/' + id + '/stage', r.token, { stage: 'at_pickup' });
+    await drain();
+    expect(h.c.push.sent).toHaveLength(0);
+    expect((await h.app.inject({ method: 'PATCH', url: '/v1/customer/preferences', headers: { authorization: 'Bearer ' + o.customer }, payload: { push: true } })).statusCode).toBe(200);
+    await call('POST', '/v1/rider/deliveries/' + id + '/stage', r.token, { stage: 'picked_up' });
+    await call('POST', '/v1/rider/deliveries/' + id + '/stage', r.token, { stage: 'at_dropoff' });
+    await drain();
+    expect(h.c.push.sent.map((m) => m.title)).toEqual(['Your order is on its way', 'Your rider has arrived']);
+    expect(h.c.push.sent[0]).toMatchObject({ to: tok });
+    // switching order updates off stops them
+    await h.app.inject({ method: 'PATCH', url: '/v1/customer/preferences', headers: { authorization: 'Bearer ' + o.customer }, payload: { orders: false } });
+    const code = (await h.app.inject({ method: 'GET', url: '/v1/orders/' + o.order.id + '/delivery', headers: { authorization: 'Bearer ' + o.customer } })).json().handoverCode as string;
+    await call('POST', '/v1/rider/deliveries/' + id + '/deliver', r.token, { code });
+    await drain();
+    expect(h.c.push.sent).toHaveLength(2);
+    expect((await h.app.inject({ method: 'DELETE', url: '/v1/customer/push-token', headers: { authorization: 'Bearer ' + o.customer }, payload: { token: tok } })).statusCode).toBe(204);
+  });
+
+  it('sends phone notifications in the rider’s language and only the kinds they want', async () => {
+    const r = await newRider('+254746000020', 'Notified Rider');
+    expect((await call('POST', '/v1/rider/push-token', r.token, { token: 'ExponentPushToken[abc123def456]', platform: 'android' })).statusCode).toBe(204);
+    await drain();
+    h.c.push.sent.length = 0;
+    // an offer reaches the phone in English
+    const o = await placeOrder({});
+    await goOnline(r);
+    await call('POST', `/v1/admin/dispatch/orders/${o.order.id}/assign`, james, { riderId: r.id });
+    await drain();
+    expect(h.c.push.sent.at(-1)).toMatchObject({ to: 'ExponentPushToken[abc123def456]', title: 'New order request' });
+    // Swahili, and requests switched off
+    const prefs = await call('PUT', '/v1/rider/me/preferences', r.token, { language: 'sw', notify: { requests: false } });
+    expect(prefs.json()).toMatchObject({ language: 'sw', notify: { requests: false, payouts: true, documents: true, account: true } });
+    const count = h.c.push.sent.length;
+    const o2 = await placeOrder({});
+    await call('POST', `/v1/admin/dispatch/orders/${o2.order.id}/assign`, james, { riderId: r.id, force: true });
+    await drain();
+    expect(h.c.push.sent).toHaveLength(count);
+    await call('PUT', '/v1/rider/me/preferences', r.token, { notify: { requests: true } });
+    await call('PUT', `/v1/admin/riders/${r.id}/documents/photo`, james, { state: 'rejected', note: 'Blurry' });
+    await drain();
+    expect(h.c.push.sent.at(-1)).toMatchObject({ title: 'Hati inahitaji kuangaliwa tena' });
+    expect((await call('PUT', '/v1/rider/me/preferences', r.token, {})).statusCode).toBe(400);
+    expect((await call('DELETE', '/v1/rider/push-token', r.token, { token: 'ExponentPushToken[abc123def456]' })).statusCode).toBe(204);
+  });
+
+  it('lists training lessons with the rider’s progress', async () => {
+    const r = await newRider('+254746000030', 'Learner Rider');
+    const lessonId = uuidv7();
+    await h.db.query(`INSERT INTO help_articles (id, title, category, body, live) VALUES ($1,'Lesson A','Rider · Training','Be safe',true)`, [lessonId]);
+    const list = (await call('GET', '/v1/rider/training', r.token)).json().items as { id: string; done: boolean }[];
+    expect(list.find((l) => l.id === lessonId)).toMatchObject({ done: false });
+    const done = (await call('POST', `/v1/rider/training/${lessonId}/done`, r.token)).json().items as { id: string; done: boolean }[];
+    expect(done.find((l) => l.id === lessonId)?.done).toBe(true);
+    expect((await call('POST', `/v1/rider/training/${uuidv7()}/done`, r.token)).statusCode).toBe(404);
   });
 });

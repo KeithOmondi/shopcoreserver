@@ -36,7 +36,7 @@ export const PreviewSchema = z.strictObject({ match: z.enum(['all', 'any']).defa
 export const PreferencesSchema = z.strictObject({ push: z.boolean(), email: z.boolean(), sms: z.boolean() });
 
 /** One row per customer with what the rules look at. Orders count once paid. */
-const FACTS = `(SELECT cu.id, cu.name, cu.area, cu.push_opt_in, cu.email_opt_in, cu.sms_opt_in, COALESCE(o.spend, 0)::bigint AS spend_cents, COALESCE(o.n, 0)::int AS orders, o.last_at
+const FACTS = `(SELECT cu.id, cu.name, cu.phone, cu.email, cu.area, cu.push_opt_in, cu.email_opt_in, cu.sms_opt_in, COALESCE(o.spend, 0)::bigint AS spend_cents, COALESCE(o.n, 0)::int AS orders, o.last_at
                   FROM customers cu LEFT JOIN (SELECT user_id, sum(total_cents) AS spend, count(*) AS n, max(created_at) AS last_at FROM orders WHERE status IN ('PAID','FULFILLED') GROUP BY user_id) o ON o.user_id = cu.id) f`;
 
 /** The WHERE clause for a segment's rules. Fields and operators come from a fixed list; values are always parameters. */
@@ -70,6 +70,14 @@ export async function segmentAudience(c: Queryable, segmentId: string): Promise<
   const s = (await c.query<SegRow>('SELECT * FROM segments WHERE id = $1', [segmentId])).rows[0];
   if (!s) throw new NotFoundError('Segment');
   return audienceOf(c, s.match_mode, s.rules);
+}
+/** The customers in a segment who agreed to hear from us on this channel. */
+export async function segmentMembers(c: Queryable, segmentId: string, channel: 'push' | 'sms' | 'email'): Promise<{ id: string; name: string; phone: string | null; email: string | null }[]> {
+  const s = (await c.query<SegRow>('SELECT * FROM segments WHERE id = $1', [segmentId])).rows[0];
+  if (!s) return [];
+  const params: unknown[] = [];
+  const where = segmentWhere(s.match_mode, s.rules, params);
+  return (await c.query<{ id: string; name: string; phone: string | null; email: string | null }>(`SELECT f.id, f.name, f.phone, f.email FROM ${FACTS} WHERE ${where} AND f.${channel}_opt_in LIMIT 100000`, params)).rows;
 }
 /** Does this customer fall in the segment right now? */
 export async function inSegment(c: Queryable, segmentId: string, customerId: string): Promise<boolean> {

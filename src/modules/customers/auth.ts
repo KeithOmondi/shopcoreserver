@@ -1,4 +1,5 @@
 import { createHash, randomBytes, randomInt } from 'node:crypto';
+import { newReferralCode } from './rewards.js';
 import { SignJWT, importPKCS8 } from 'jose';
 import { z } from 'zod';
 import type { Config } from '../../config/index.js';
@@ -16,7 +17,7 @@ const password = z.string().min(8, 'Use at least 8 characters').max(128);
 const identifier = z.string().trim().min(3).max(254);
 const code = z.string().regex(/^\d{6}$/, 'The code is 6 digits');
 
-export const SignUpSchema = z.strictObject({ fullName: z.string().trim().min(2).max(120), email, phone, password });
+export const SignUpSchema = z.strictObject({ fullName: z.string().trim().min(2).max(120), email, phone, password, referralCode: z.string().trim().toUpperCase().regex(/^[A-Z0-9]{6,12}$/, 'That invite code does not look right').optional() });
 export const VerifySignupSchema = z.strictObject({ phone, code });
 export const ResendSchema = z.strictObject({ phone });
 export const CustomerLoginSchema = z.strictObject({ identifier, password: z.string().min(1).max(128) });
@@ -69,9 +70,9 @@ export class CustomerAuthService {
       const prev = (await q.query<{ sent_at: Date }>('SELECT sent_at FROM customer_signups WHERE phone = $1', [input.phone])).rows[0];
       if (prev && Date.now() - prev.sent_at.getTime() < 30_000) throw new AppError('CODE_TOO_SOON', 'Wait a moment before asking for another code', 429, undefined, 30);
       await q.query(
-        `INSERT INTO customer_signups (phone, full_name, email, password_hash, code_hash, expires_at) VALUES ($1,$2,$3,$4,$5, now() + interval '10 minutes')
-         ON CONFLICT (phone) DO UPDATE SET full_name = $2, email = $3, password_hash = $4, code_hash = $5, attempts = 0, sent_at = now(), expires_at = now() + interval '10 minutes'`,
-        [input.phone, input.fullName, input.email, hash, hashCode(input.phone, c)]);
+        `INSERT INTO customer_signups (phone, full_name, email, password_hash, code_hash, referral_code, expires_at) VALUES ($1,$2,$3,$4,$5,$6, now() + interval '10 minutes')
+         ON CONFLICT (phone) DO UPDATE SET full_name = $2, email = $3, password_hash = $4, code_hash = $5, referral_code = $6, attempts = 0, sent_at = now(), expires_at = now() + interval '10 minutes'`,
+        [input.phone, input.fullName, input.email, hash, hashCode(input.phone, c), input.referralCode ?? null]);
     });
     await this.sms.send(input.phone, `Your ShopCore code is ${c}. It expires in 10 minutes.`);
   }
@@ -92,13 +93,14 @@ export class CustomerAuthService {
     let failed = false;
     const id = uuidv7();
     const out = await this.db.tx(async (q) => {
-      const r = (await q.query<{ full_name: string; email: string; password_hash: string; code_hash: string; attempts: number; expired: boolean }>('SELECT full_name, email, password_hash, code_hash, attempts, (expires_at < now()) AS expired FROM customer_signups WHERE phone = $1 FOR UPDATE', [p])).rows[0];
+      const r = (await q.query<{ referral_code: string | null; full_name: string; email: string; password_hash: string; code_hash: string; attempts: number; expired: boolean }>('SELECT referral_code, full_name, email, password_hash, code_hash, attempts, (expires_at < now()) AS expired FROM customer_signups WHERE phone = $1 FOR UPDATE', [p])).rows[0];
       if (!r || r.expired) throw new UnprocessableError('CODE_EXPIRED', 'That code has expired. Ask for a new one.');
       if (r.attempts >= 5) throw new AppError('CODE_LOCKED', 'Too many wrong codes. Ask for a new one.', 429);
       if (r.code_hash !== hashCode(p, given)) { failed = true; await q.query('UPDATE customer_signups SET attempts = attempts + 1 WHERE phone = $1', [p]); return null; }
       await q.query('DELETE FROM customer_signups WHERE phone = $1', [p]);
       // A guest who ordered before has a row for this number; a new account is a fresh person.
-      await q.query('INSERT INTO customers (id, name, email, phone) VALUES ($1,$2,$3,$4)', [id, r.full_name, r.email, p]);
+      const ref = r.referral_code ? (await q.query<{ id: string }>('SELECT id FROM customers WHERE referral_code = $1', [r.referral_code])).rows[0]?.id ?? null : null;
+      await q.query('INSERT INTO customers (id, name, email, phone, referral_code, referred_by) VALUES ($1,$2,$3,$4,$5,$6)', [id, r.full_name, r.email, p, newReferralCode(), ref]);
       await q.query('INSERT INTO customer_accounts (id, email, phone, password_hash) VALUES ($1,$2,$3,$4)', [id, r.email, p, r.password_hash])
         .catch((e: { code?: string }) => { if (e.code === '23505') throw new ConflictError('ACCOUNT_EXISTS', 'An account with these details already exists'); throw e; });
       await audit(q, { id, requestId: `signup:${id}`, name: r.full_name }, 'customer.signup', 'customer', id, {});

@@ -126,10 +126,12 @@ export class EngageService {
 
   // ---- banners -------------------------------------------------------------------------------------------------------------------------------
 
-  /** Where a banner may point: the storefront's own routes, its categories, and published pages. Anything else is a broken link. */
+  /** Where a banner may point: the storefront's own routes (including /deals), its products and categories, and published pages. Anything else is a broken link. */
   private async linkOk(c: Queryable, link: string) {
-    const fixed = ['/', '/collections/new', '/collections/sale', '/loyalty', '/referral'];
+    const fixed = ['/', '/deals', '/home/deals', '/collections/new', '/collections/sale', '/loyalty', '/referral'];
     if (fixed.includes(link)) return true;
+    const prod = /^\/product\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i.exec(link);
+    if (prod && (await c.query("SELECT 1 FROM products WHERE id = $1 AND active AND status = 'active'", [prod[1]])).rowCount) return true;
     const cat = /^\/categories\/([a-z0-9-]+)$/.exec(link);
     if (cat && (await c.query('SELECT 1 FROM categories WHERE handle = $1', [cat[1]])).rowCount) return true;
     return !!(await c.query(`SELECT 1 FROM content_pages WHERE slug = $1 AND status = 'published'`, [link])).rowCount;

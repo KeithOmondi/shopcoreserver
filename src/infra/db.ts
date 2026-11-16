@@ -69,7 +69,7 @@ function makePool(url: string, max: number, cfg: Config, name: string, log: Logg
     idle_in_transaction_session_timeout: cfg.DB_STATEMENT_TIMEOUT_MS * 2,
     application_name: `${cfg.SERVICE_NAME}:${name}`,
     keepAlive: true,
-    ssl: cfg.DB_SSL ? { rejectUnauthorized: true } : undefined,
+    ssl: cfg.DB_SSL ? { rejectUnauthorized: cfg.DB_SSL_VERIFY } : undefined,
     allowExitOnIdle: false,
   });
   // An idle client erroring (e.g. failover) must never crash the process.

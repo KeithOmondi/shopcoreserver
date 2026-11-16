@@ -16,10 +16,18 @@ import { WarehouseService } from './modules/inventory/warehouse.js';
 import { AdminOrdersService, CustomersService } from './modules/orders/admin-orders.js';
 import { ZonesService } from './modules/dispatch/zones.js';
 import { RidersService } from './modules/dispatch/riders.js';
+import { CampaignSender } from './modules/marketing/sender.js';
+import { RewardsService } from './modules/customers/rewards.js';
+import { makeEmail } from './modules/integrations/email.js';
 import { makeSms } from './modules/integrations/sms.js';
+import { PushService } from './modules/integrations/push.js';
 import { CustomerAuthService } from './modules/customers/auth.js';
+import { CustomerAccountService } from './modules/customers/account.js';
+import { CustomerEngagementService } from './modules/customers/engagement.js';
+import { CustomerOrdersService } from './modules/orders/customer-orders.js';
 import { MpesaService, makeMpesaClient } from './modules/integrations/mpesa.js';
 import { UploadService } from './modules/integrations/storage.js';
+import { S3Store } from './modules/integrations/s3-store.js';
 import { DispatchService } from './modules/dispatch/dispatch.js';
 import { RiderMoneyService } from './modules/dispatch/money.js';
 import { SupportService } from './modules/support/support.js';
@@ -41,6 +49,7 @@ import { ContentService, StorefrontService } from './modules/marketing/content.j
  * lets tests substitute real or fake implementations.
  */
 export interface Container extends AppDeps {
+  sms: import('./modules/dispatch/riders.js').SmsSender;
   db: Database;
   redis: RedisClient;
   close: () => Promise<void>;
@@ -79,22 +88,32 @@ export async function createContainer(cfg: Config, log: Logger): Promise<Contain
   const customers = new CustomersService(db);
   const zones = new ZonesService(db);
   const sms = makeSms(cfg, log);
+  const push = new PushService(db, cfg, log);
   const riders = new RidersService(db, cfg, sms);
   const customerAuth = new CustomerAuthService(db, cfg, sms);
-  const dispatch = new DispatchService(db);
+  const customerAccount = new CustomerAccountService(db, cfg, sms);
+  const customerOrders = new CustomerOrdersService(db);
+  const customerEngagement = new CustomerEngagementService(db);
+  const rewards = new RewardsService(db);
+  const dispatch = new DispatchService(db, sms);
   const riderMoney = new RiderMoneyService(db);
   const support = new SupportService(db);
   const claims = new ClaimsService(db);
   const paymentsAdmin = new PaymentsService(db, orders, cfg.MPESA_ENV === 'sandbox' || cfg.MPESA_ENV === 'production' ? askCustomerGateway : devGateway);
   const cash = new CashService(db, cfg.NODE_ENV === 'production' ? unconnectedPayouts : devPayoutGateway);
   const mpesa = new MpesaService(db, cfg, makeMpesaClient(cfg), orders, paymentsAdmin, log);
-  const uploads = new UploadService(db, cfg);
+  const uploads = (() => {
+    if (cfg.STORAGE_PROVIDER !== 's3') return new UploadService(db, cfg);
+    const s3 = (bucket: string) => new S3Store({ bucket, region: cfg.S3_REGION, accessKeyId: cfg.S3_ACCESS_KEY_ID!, secretAccessKey: cfg.S3_SECRET_ACCESS_KEY!, endpoint: cfg.S3_ENDPOINT, prefix: cfg.S3_PREFIX });
+    const priv = s3(cfg.S3_BUCKET!);
+    return new UploadService(db, cfg, priv, cfg.S3_PUBLIC_BUCKET ? s3(cfg.S3_PUBLIC_BUCKET) : priv);
+  })();
   const billing = new BillingService(db);
   const payroll = new PayrollService(db);
   const reports = new ReportsService(db, cash);
   const audience = new AudienceService(db);
   const promotions = new PromotionsService(db);
-  const engage = new EngageService(db);
+  const engage = new EngageService(db, new CampaignSender(db, sms, makeEmail(cfg, log), log));
   const content = new ContentService(db);
   const storefront = new StorefrontService(db, engage, promotions);
 
@@ -105,6 +124,7 @@ export async function createContainer(cfg: Config, log: Logger): Promise<Contain
   return {
     cfg,
     log,
+    sms,
     db,
     redis,
     verifier,
@@ -121,6 +141,7 @@ export async function createContainer(cfg: Config, log: Logger): Promise<Contain
     customers,
     zones,
     riders,
+    push,
     dispatch,
     riderMoney,
     support,
@@ -133,6 +154,10 @@ export async function createContainer(cfg: Config, log: Logger): Promise<Contain
     mpesa,
     uploads,
     customerAuth,
+    customerAccount,
+    customerOrders,
+    customerEngagement,
+    rewards,
     audience,
     promotions,
     engage,

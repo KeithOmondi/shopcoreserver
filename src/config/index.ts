@@ -27,6 +27,10 @@ const schema = z.object({
   DB_CONNECT_TIMEOUT_MS: z.coerce.number().int().min(100).default(3000),
   DB_IDLE_TIMEOUT_MS: z.coerce.number().int().min(1000).default(30000),
   DB_SSL: bool.default(false),
+  // Some managed databases (Render, for one) use a certificate Node can't verify. Set false to encrypt without checking it.
+  DB_SSL_VERIFY: bool.default(true),
+  // Run any waiting database migrations when the API starts (one-box hosts without a separate migration job).
+  RUN_MIGRATIONS: bool.default(false),
   DB_TX_MAX_RETRIES: z.coerce.number().int().min(0).max(10).default(3),
 
   REDIS_URL: z.string().url(),
@@ -101,9 +105,20 @@ const schema = z.object({
   OUTBOX_POLL_INTERVAL_MS: z.coerce.number().int().min(10).default(200),
 
   // Text messages. 'console' only logs (development); 'africastalking' sends for real.
-  SMS_PROVIDER: z.enum(['console', 'africastalking']).default('console'),
+  // Email (campaigns). console = log only. brevo = send through Brevo; the sender address must be verified in your Brevo account.
+  EMAIL_PROVIDER: z.enum(['console', 'brevo']).default('console'),
+  BREVO_API_KEY: z.string().optional(),
+  EMAIL_FROM_ADDRESS: z.string().email().optional(),
+  EMAIL_FROM_NAME: z.string().max(60).default('ShopCore'),
+  SMS_PROVIDER: z.enum(['console', 'africastalking', 'talksasa']).default('console'),
+  // Phone notifications: 'console' only logs them (development); 'expo' sends them through Expo's push service.
+  PUSH_PROVIDER: z.enum(['console', 'expo']).default('console'),
+  EXPO_ACCESS_TOKEN: z.string().optional(),
   AT_USERNAME: z.string().optional(),
   AT_API_KEY: z.string().optional(),
+  TALKSASA_API_TOKEN: z.string().optional(),
+  TALKSASA_SENDER_ID: z.string().max(11).optional(),
+  TALKSASA_BASE_URL: z.string().url().default('https://bulksms.talksasa.com/api/v3'),
   AT_SENDER_ID: z.string().max(11).optional(),
   // M-Pesa (Safaricom Daraja). 'off' disables it; 'simulator' answers locally with no network (development only).
   MPESA_ENV: z.enum(['off', 'simulator', 'sandbox', 'production']).default('off'),
@@ -116,6 +131,16 @@ const schema = z.object({
   MPESA_CALLBACK_SECRET: z.string().min(24).optional(),
   // Uploaded files (photos, documents). Local disk now; point this at a mounted volume in production.
   UPLOAD_DIR: z.string().default('./uploads'),
+  // Where files are kept: 'disk' (UPLOAD_DIR) or 's3' (any S3-compatible bucket: Amazon S3, Cloudflare R2, DigitalOcean Spaces...).
+  STORAGE_PROVIDER: z.enum(['disk', 's3']).default('disk'),
+  S3_BUCKET: z.string().optional(),
+  // Optional second bucket for the shop's public pictures (product images, banners). Same account and keys. Rider papers and photos stay in S3_BUCKET.
+  S3_PUBLIC_BUCKET: z.string().optional(),
+  S3_REGION: z.string().default('auto'),
+  S3_ENDPOINT: z.string().url().optional(),
+  S3_ACCESS_KEY_ID: z.string().optional(),
+  S3_SECRET_ACCESS_KEY: z.string().optional(),
+  S3_PREFIX: z.string().default(''),
   UPLOAD_MAX_BYTES: z.coerce.number().int().min(1024).max(25_000_000).default(5_000_000),
 
   // Observability
@@ -160,7 +185,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, role: 'api' | '
       throw new Error('Invalid configuration: one of JWT_JWKS_URL, JWT_PUBLIC_KEY or JWT_PUBLIC_KEY_FILE is required');
     }
   }
+  if (cfg.EMAIL_PROVIDER === 'brevo' && !(cfg.BREVO_API_KEY && cfg.EMAIL_FROM_ADDRESS)) throw new Error('Invalid configuration: BREVO_API_KEY and EMAIL_FROM_ADDRESS are required for EMAIL_PROVIDER=brevo');
+  if (cfg.SMS_PROVIDER === 'talksasa' && !(cfg.TALKSASA_API_TOKEN && cfg.TALKSASA_SENDER_ID)) throw new Error('Invalid configuration: TALKSASA_API_TOKEN and TALKSASA_SENDER_ID are required for SMS_PROVIDER=talksasa');
   if (cfg.SMS_PROVIDER === 'africastalking' && !(cfg.AT_USERNAME && cfg.AT_API_KEY)) throw new Error('Invalid configuration: AT_USERNAME and AT_API_KEY are required for SMS_PROVIDER=africastalking');
+  if (cfg.STORAGE_PROVIDER === 's3') {
+    const missing = ['S3_BUCKET', 'S3_ACCESS_KEY_ID', 'S3_SECRET_ACCESS_KEY'].filter((k) => !cfg[k as keyof typeof cfg]);
+    if (missing.length) throw new Error(`Invalid configuration: STORAGE_PROVIDER=s3 needs ${missing.join(', ')}`);
+  }
+  if (cfg.S3_PUBLIC_BUCKET && cfg.S3_PUBLIC_BUCKET === cfg.S3_BUCKET) throw new Error('Invalid configuration: S3_PUBLIC_BUCKET must be a different bucket from S3_BUCKET');
   if (cfg.MPESA_ENV === 'sandbox' || cfg.MPESA_ENV === 'production') {
     const missing = ['MPESA_CONSUMER_KEY', 'MPESA_CONSUMER_SECRET', 'MPESA_SHORTCODE', 'MPESA_PASSKEY', 'MPESA_CALLBACK_BASE_URL', 'MPESA_CALLBACK_SECRET'].filter((k) => !cfg[k as keyof typeof cfg]);
     if (missing.length) throw new Error(`Invalid configuration: MPESA_ENV=${cfg.MPESA_ENV} needs ${missing.join(', ')}`);
