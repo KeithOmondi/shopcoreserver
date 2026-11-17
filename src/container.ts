@@ -31,6 +31,7 @@ import { S3Store } from './modules/integrations/s3-store.js';
 import { DispatchService } from './modules/dispatch/dispatch.js';
 import { RiderMoneyService } from './modules/dispatch/money.js';
 import { SupportService } from './modules/support/support.js';
+import { ChatHub, type ChatBus } from './modules/support/chat-hub.js';
 import { ClaimsService } from './modules/support/claims.js';
 import type { AppDeps } from './http/app.js';
 import { PaymentsService, askCustomerGateway, devGateway } from './modules/finance/payments.js';
@@ -97,7 +98,7 @@ export async function createContainer(cfg: Config, log: Logger): Promise<Contain
   const rewards = new RewardsService(db);
   const dispatch = new DispatchService(db, sms);
   const riderMoney = new RiderMoneyService(db);
-  const support = new SupportService(db);
+  const support = new SupportService(db, new ChatHub(cfg.REDIS_CLUSTER ? undefined : (redis as unknown as ChatBus), (m) => log.warn(m)));
   const claims = new ClaimsService(db);
   const paymentsAdmin = new PaymentsService(db, orders, cfg.MPESA_ENV === 'sandbox' || cfg.MPESA_ENV === 'production' ? askCustomerGateway : devGateway);
   const cash = new CashService(db, cfg.NODE_ENV === 'production' ? unconnectedPayouts : devPayoutGateway);

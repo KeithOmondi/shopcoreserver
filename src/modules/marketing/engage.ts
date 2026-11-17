@@ -22,9 +22,9 @@ export const smsParts = (s: string) => (s.length <= 160 ? 1 : Math.ceil(s.length
 // ============ banners and the homepage ==================================================================================================================
 
 export const BannerSchema = z.strictObject({
-  title: z.string().trim().min(1).max(80),
+  title: z.string().trim().max(80).default(''),
   label: z.string().trim().max(40).default(''),
-  link: z.string().trim().min(1).max(200),
+  link: z.string().trim().max(200).default(''),
   platform: z.enum(['Web and mobile', 'Mobile only', 'Web only']).default('Web and mobile'),
   startsAt: when,
   endsAt: when,
@@ -129,7 +129,7 @@ export class EngageService {
   /** Where a banner may point: the storefront's own routes (including /deals), its products and categories, and published pages. Anything else is a broken link. */
   private async linkOk(c: Queryable, link: string) {
     const fixed = ['/', '/deals', '/home/deals', '/collections/new', '/collections/sale', '/loyalty', '/referral'];
-    if (fixed.includes(link)) return true;
+    if (!link || fixed.includes(link)) return true; // no link is fine: the banner is just a picture
     const prod = /^\/product\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i.exec(link);
     if (prod && (await c.query("SELECT 1 FROM products WHERE id = $1 AND active AND status = 'active'", [prod[1]])).rowCount) return true;
     const cat = /^\/categories\/([a-z0-9-]+)$/.exec(link);
@@ -161,8 +161,8 @@ export class EngageService {
         m = BannerSchema.parse({ title: cur.title, label: cur.label, link: cur.link, platform: cur.platform, startsAt: cur.starts_at.toISOString(), endsAt: cur.ends_at.toISOString(), tone: cur.tone, alt: cur.alt, imageRef: cur.image_ref, published: cur.published, ...input });
       } else m = BannerSchema.parse(input);
       if (Date.parse(m.endsAt) <= Date.parse(m.startsAt)) throw new UnprocessableError('BAD_DATES', 'The end must be after the start');
+      if (!m.title && !m.imageRef) throw new UnprocessableError('BANNER_EMPTY', 'Add a picture or a headline, so the banner has something to show');
       if (m.published) {
-        if (!m.alt) throw new UnprocessableError('ALT_REQUIRED', 'Add alt text before publishing, so screen readers can describe the banner');
         if (!(await this.linkOk(c, m.link))) throw new UnprocessableError('BROKEN_LINK', 'That link doesn’t go anywhere in the shop. Fix it before publishing', { link: m.link });
       }
       const cols = [m.title, m.label, m.link, m.platform, m.startsAt, m.endsAt, m.tone, m.alt, m.imageRef, m.published];

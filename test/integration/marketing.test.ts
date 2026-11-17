@@ -250,9 +250,11 @@ describe('flash sales and bundles', () => {
 });
 
 describe('banners and the homepage', () => {
-  it('won’t publish a banner without alt text or with a broken link, and shows only what is live', async () => {
+  it('takes a picture-only banner, won’t publish a broken link, and shows only what is live', async () => {
     const base = { title: 'New arrivals', link: '/collections/new', startsAt: iso(-DAY), endsAt: iso(10 * DAY), tone: 0 };
-    expect((await call('POST', '/v1/admin/banners', ruth, { ...base, published: true })).json().error.code).toBe('ALT_REQUIRED');
+    // A ready-made picture needs no headline, link or description; an empty banner is refused.
+    expect((await call('POST', '/v1/admin/banners', ruth, { startsAt: base.startsAt, endsAt: base.endsAt })).json().error.code).toBe('BANNER_EMPTY');
+    expect((await call('POST', '/v1/admin/banners', ruth, { startsAt: base.startsAt, endsAt: base.endsAt, imageRef: 'file-1' })).json()).toMatchObject({ title: '', link: '', alt: '', linkOk: true, status: 'Draft' });
     expect((await call('POST', '/v1/admin/banners', ruth, { ...base, alt: 'Models', link: '/collections/summer', published: true })).json().error.code).toBe('BROKEN_LINK');
     const b1 = (await call('POST', '/v1/admin/banners', ruth, { ...base, alt: 'Models in new arrivals', published: true })).json();
     const b2 = (await call('POST', '/v1/admin/banners', ruth, { ...base, title: 'Bags', link: '/categories/bags', alt: 'Bags', published: true, platform: 'Mobile only' })).json();
@@ -262,7 +264,7 @@ describe('banners and the homepage', () => {
     expect((await call('GET', '/v1/storefront/home?platform=web', null)).json().banners.map((b: { title: string }) => b.title)).toEqual(['New arrivals']);
     expect((await call('GET', '/v1/storefront/home?platform=mobile', null)).json().banners.map((b: { title: string }) => b.title)).toEqual(['New arrivals', 'Bags']);
     const moved = (await call('POST', `/v1/admin/banners/${b2.id}/move`, ruth, { dir: -1 })).json();
-    expect(moved.items.slice(0, 2).map((b: { title: string }) => b.title)).toEqual(['Bags', 'New arrivals']);
+    expect(moved.items.slice(1, 3).map((b: { title: string }) => b.title)).toEqual(['Bags', 'New arrivals']);
     expect((await call('PATCH', `/v1/admin/banners/${b1.id}`, ruth, { published: false })).json().status).toBe('Draft');
     expect((await call('GET', '/v1/storefront/home?platform=web', null)).json().banners).toHaveLength(0);
     expect((await call('DELETE', `/v1/admin/banners/${b2.id}`, ruth)).statusCode).toBe(204);

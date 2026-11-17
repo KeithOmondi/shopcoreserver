@@ -5,7 +5,7 @@ import {
   StaffRefundSchema, type ClaimsActor, type ClaimsService,
 } from '../modules/support/claims.js';
 import {
-  AgentReplySchema, ArticlePatchSchema, ArticleSchema, AssignSchema, CannedPatchSchema, CannedSchema, ChatListSchema, ChatMessageSchema, HelpSearchSchema, OwnTicketSchema, RateSchema, ReviewListSchema,
+  AgentReplySchema, ArticlePatchSchema, ArticleSchema, AssignSchema, CannedPatchSchema, CannedSchema, ChatListSchema, ChatMessageSchema, HelpSearchSchema, LiveSchema, OwnTicketSchema, RateSchema, ReviewListSchema,
   ReviewReplySchema, ReviewSchema, ReviewStateSchema, StaffTicketSchema, StartChatSchema, TextSchema, TicketListSchema, TicketStatusSchema, type SupportService,
 } from '../modules/support/support.js';
 import { ForbiddenError } from '../domain/errors.js';
@@ -36,7 +36,7 @@ export function registerSupportRoutes(app: FastifyInstance, svc: SupportServices
   app.post('/v1/admin/tickets/:id/status', (req) => guard(req, [['Support', 'Edit']], (a) => support.setStatus(parse(IdParam, req.params).id, parse(TicketStatusSchema, req.body), a)));
 
   app.get('/v1/admin/chats', (req, reply) => guard(req, [['Support', 'View']], async (a) => { NoStore(reply); return support.chats(parse(ChatListSchema, req.query), a.id); }));
-  app.get('/v1/admin/chats/:id', (req, reply) => guard(req, [['Support', 'View']], async () => { NoStore(reply); return support.chat(parse(IdParam, req.params).id); }));
+  app.get('/v1/admin/chats/:id', (req, reply) => guard(req, [['Support', 'View']], async () => { NoStore(reply); return support.chat(parse(IdParam, req.params).id, parse(LiveSchema, req.query)); }));
   app.post('/v1/admin/chats', (req, reply) => guard(req, [['Support', 'Create']], async (a) => reply.status(201).send(await support.chatStart(parse(StartChatSchema, req.body), a))));
   app.post('/v1/admin/chats/:id/messages', (req) => guard(req, [['Support', 'Edit']], (a) => support.chatSend(parse(IdParam, req.params).id, parse(TextSchema, req.body).text, a)));
   app.post('/v1/admin/chats/:id/take', (req) => guard(req, [['Support', 'Edit']], (a) => support.chatTake(parse(IdParam, req.params).id, a)));
@@ -86,7 +86,7 @@ export function registerSupportRoutes(app: FastifyInstance, svc: SupportServices
   app.get('/v1/support/tickets/:id', async (req, reply) => { NoStore(reply); return support.mine(requireRole(req, 'customer').sub, parse(IdParam, req.params).id); });
   app.post('/v1/support/tickets/:id/messages', async (req) => support.customerReply(await shopper(req), parse(IdParam, req.params).id, parse(TextSchema, req.body).text));
   app.post('/v1/support/tickets/:id/rating', async (req) => support.rate(await shopper(req), parse(IdParam, req.params).id, parse(RateSchema, req.body).csat));
-  app.get('/v1/support/chat', async (req, reply) => { NoStore(reply); return support.myChat(requireRole(req, 'customer').sub); });
+  app.get('/v1/support/chat', async (req, reply) => { NoStore(reply); return support.myChat(requireRole(req, 'customer').sub, parse(LiveSchema, req.query)); });
   app.post('/v1/support/chat/messages', async (req) => support.customerChatSend(await shopper(req), parse(ChatMessageSchema, req.body)));
 
   app.post('/v1/orders/:id/returns', async (req, reply) => reply.status(201).send(await claims.submitReturn(await shopper(req), parse(IdParam, req.params).id, parse(OwnReturnSchema, req.body))));

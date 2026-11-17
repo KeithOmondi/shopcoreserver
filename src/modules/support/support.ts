@@ -5,6 +5,7 @@ import { isUuid, uuidv7 } from '../../infra/uuid.js';
 import { decodeCursor, encodeCursor } from '../../http/pagination.js';
 import { flag, patchOf } from '../../http/validate.js';
 import { audit, type Actor } from '../products/products.js';
+import { ChatHub } from './chat-hub.js';
 
 const uuid = z.string().refine(isUuid, 'must be a UUID');
 export const PRIORITIES = ['urgent', 'high', 'normal', 'low'] as const;
@@ -31,7 +32,9 @@ export const AssignSchema = z.strictObject({ assigneeId: uuid.nullable() });
 export const TicketStatusSchema = z.strictObject({ status: z.enum(['open', 'pending', 'escalated', 'resolved']), priority: z.enum(PRIORITIES).optional() });
 export const RateSchema = z.strictObject({ csat: z.number().int().min(1).max(5) });
 
-export const ChatListSchema = z.object({ state: z.enum(['open', 'closed']).default('open'), mine: flag.optional(), limit: z.coerce.number().int().min(1).max(100).default(50) });
+/** Live updates: send the `v` you last got and `wait` (seconds); the answer comes as soon as something changes, or after `wait` with nothing new. */
+export const LiveSchema = z.object({ v: z.string().max(400).optional(), wait: z.coerce.number().min(0).max(8).default(0) });
+export const ChatListSchema = z.object({ state: z.enum(['open', 'closed']).default('open'), mine: flag.optional(), limit: z.coerce.number().int().min(1).max(100).default(50), v: z.string().max(400).optional(), wait: z.coerce.number().min(0).max(8).default(0) });
 export const StartChatSchema = z.strictObject({ customerId: uuid, orderId: uuid.optional() });
 export const ChatMessageSchema = z.strictObject({ text: z.string().trim().min(1).max(2000), orderId: uuid.optional() });
 
@@ -65,7 +68,15 @@ const ticketView = (t: TicketRow) => ({
 });
 
 export class SupportService {
-  constructor(private readonly db: Database) {}
+  constructor(private readonly db: Database, readonly hub: ChatHub = new ChatHub()) {}
+
+  /** Answers now when what the caller has is out of date; otherwise holds the request until something changes (or `wait` seconds pass). */
+  private async live<T>(match: (e: { chatId: string; customerId: string }) => boolean, read: () => Promise<T>, versionOf: (r: T) => string, v: string | undefined, wait: number): Promise<T> {
+    const pending = v && wait > 0 ? this.hub.listen(match, wait * 1000) : null;
+    const now = await read();
+    if (!pending || versionOf(now) !== v) { pending?.cancel(); return now; }
+    return (await pending.promise) ? read() : now;
+  }
 
   // ---- overview -------------------------------------------------------------------------------------------------------
 
@@ -254,13 +265,18 @@ export class SupportService {
   // ---- live chat -----------------------------------------------------------------------------------------------------------------
 
   async chats(q: z.infer<typeof ChatListSchema>, staffId: string) {
+    return this.live(() => true, () => this.chatList(q, staffId), (r) => r.version, q.v, q.wait);
+  }
+
+  private async chatList(q: z.infer<typeof ChatListSchema>, staffId: string) {
     return this.db.read(async (c) => {
       const { rows } = await c.query<{ id: string; customer_id: string; name: string; assignee_id: string | null; assignee_name: string | null; closed: boolean; unread: number; last_at: Date; order_no: number | null; last: string | null }>(
         `SELECT ch.id, ch.customer_id, ch.name, ch.assignee_id, ch.assignee_name, ch.closed, ch.unread, ch.last_at, o.order_no,
                 (SELECT body FROM chat_messages m WHERE m.chat_id = ch.id ORDER BY m.id DESC LIMIT 1) AS last
            FROM chats ch LEFT JOIN orders o ON o.id = ch.order_id WHERE ch.closed = ($1 = 'closed') AND (NOT $2 OR ch.assignee_id = $3) ORDER BY ch.unread DESC, ch.last_at DESC LIMIT $4`,
         [q.state, q.mine === true, staffId, q.limit]);
-      return { items: rows.map((r) => ({ id: r.id, customerId: r.customer_id, name: r.name, assigneeId: r.assignee_id, assignee: r.assignee_name, closed: r.closed, unread: r.unread, lastAt: r.last_at.toISOString(), order: r.order_no ? `SC-${r.order_no}` : null, lastMessage: r.last })) };
+      const items = rows.map((r) => ({ id: r.id, customerId: r.customer_id, name: r.name, assigneeId: r.assignee_id, assignee: r.assignee_name, closed: r.closed, unread: r.unread, lastAt: r.last_at.toISOString(), order: r.order_no ? `SC-${r.order_no}` : null, lastMessage: r.last }));
+      return { items, version: items.map((i) => `${i.id}.${i.unread}.${i.lastAt}.${i.assigneeId ?? ''}`).join('|') };
     });
   }
 
@@ -270,13 +286,17 @@ export class SupportService {
     if (!ch) throw new NotFoundError('Chat');
     const msgs = (await c.query<{ id: number; from_kind: string; by_name: string; body: string; at: Date }>('SELECT id, from_kind, by_name, body, at FROM chat_messages WHERE chat_id = $1 ORDER BY id', [id])).rows;
     return { id: ch.id, customerId: ch.customer_id, name: ch.name, assigneeId: ch.assignee_id, assignee: ch.assignee_name, closed: ch.closed, unread: ch.unread, order: ch.order_no ? `SC-${ch.order_no}` : null,
+      version: `${msgs.length}.${msgs.at(-1)?.id ?? 0}.${ch.closed ? 1 : 0}.${ch.assignee_id ?? ''}`,
       messages: msgs.map((m) => ({ id: String(m.id), from: m.from_kind, by: m.by_name, text: m.body, at: m.at.toISOString() })) };
   }
 
   /** Opening a chat marks the customer’s messages as read. */
-  async chat(id: string) {
-    await this.db.tx((c) => c.query('UPDATE chats SET unread = 0 WHERE id = $1', [id]));
-    return this.db.read((c) => this.loadChat(c, id));
+  async chat(id: string, live: z.infer<typeof LiveSchema> = { wait: 0 }) {
+    return this.live((e) => e.chatId === id, async () => {
+      const cleared = await this.db.tx((c) => c.query('UPDATE chats SET unread = 0 WHERE id = $1 AND unread <> 0', [id]));
+      if (cleared.rowCount) this.hub.publish({ chatId: id, customerId: '' });
+      return this.db.read((c) => this.loadChat(c, id));
+    }, (r) => r.version, live.v, live.wait);
   }
 
   async chatSend(id: string, text: string, actor: Actor) {
@@ -287,7 +307,9 @@ export class SupportService {
       await c.query('INSERT INTO chat_messages (chat_id, from_kind, by_name, body) VALUES ($1,$2,$3,$4)', [id, 'agent', actor.name ?? 'Staff', text]);
       await c.query('UPDATE chats SET assignee_id = COALESCE(assignee_id, $2), assignee_name = COALESCE(assignee_name, $3), unread = 0, last_at = now() WHERE id = $1', [id, actor.id, actor.name ?? 'Staff']);
     });
-    return this.db.read((c) => this.loadChat(c, id));
+    const out = await this.db.read((c) => this.loadChat(c, id));
+    this.hub.publish({ chatId: id, customerId: out.customerId });
+    return out;
   }
 
   async chatTake(id: string, actor: Actor) {
@@ -295,15 +317,19 @@ export class SupportService {
       const { rowCount } = await c.query('UPDATE chats SET assignee_id = $2, assignee_name = $3 WHERE id = $1 AND NOT closed', [id, actor.id, actor.name ?? 'Staff']);
       if (!rowCount) throw new NotFoundError('Open chat');
     });
-    return this.db.read((c) => this.loadChat(c, id));
+    const out = await this.db.read((c) => this.loadChat(c, id));
+    this.hub.publish({ chatId: id, customerId: out.customerId });
+    return out;
   }
 
   async chatClose(id: string, actor: Actor) {
-    await this.db.tx(async (c) => {
-      const { rowCount } = await c.query('UPDATE chats SET closed = true, unread = 0 WHERE id = $1', [id]);
-      if (!rowCount) throw new NotFoundError('Chat');
+    const customerId = await this.db.tx(async (c) => {
+      const { rows } = await c.query<{ customer_id: string }>('UPDATE chats SET closed = true, unread = 0 WHERE id = $1 RETURNING customer_id', [id]);
+      if (!rows[0]) throw new NotFoundError('Chat');
       await audit(c, actor, 'chat.close', 'chat', id, {});
+      return rows[0].customer_id;
     });
+    this.hub.publish({ chatId: id, customerId });
   }
 
   /** Staff reach out to a customer. If they already have an open chat, that one is used. */
@@ -316,16 +342,22 @@ export class SupportService {
       await c.query('INSERT INTO chats (id, customer_id, name, order_id, assignee_id, assignee_name) VALUES ($1,$2,$3,$4,$5,$6)', [nid, input.customerId, name, input.orderId ?? null, actor.id, actor.name ?? 'Staff']);
       return nid;
     });
-    return this.db.read((c) => this.loadChat(c, id));
+    const out = await this.db.read((c) => this.loadChat(c, id));
+    this.hub.publish({ chatId: id, customerId: out.customerId });
+    return out;
   }
 
   /** The shopper’s side: their open conversation, if any. */
-  async myChat(customerId: string) {
+  async myChat(customerId: string, live: z.infer<typeof LiveSchema> = { wait: 0 }) {
+    return this.live((e) => e.customerId === customerId, () => this.readMyChat(customerId), (r) => r.chat?.version ?? 'none', live.v, live.wait);
+  }
+
+  private async readMyChat(customerId: string) {
     return this.db.read(async (c) => {
       const open = (await c.query<{ id: string }>('SELECT id FROM chats WHERE customer_id = $1 AND NOT closed', [customerId])).rows[0];
       if (!open) return { chat: null };
       const ch = await this.loadChat(c, open.id);
-      return { chat: { id: ch.id, agent: ch.assignee, order: ch.order, messages: ch.messages.map((m) => ({ ...m, by: m.from === 'agent' ? ch.assignee ?? 'ShopCore support' : m.by })) } };
+      return { chat: { id: ch.id, agent: ch.assignee, order: ch.order, version: ch.version, messages: ch.messages.map((m) => ({ ...m, by: m.from === 'agent' ? ch.assignee ?? 'ShopCore support' : m.by })) } };
     });
   }
 
@@ -336,8 +368,9 @@ export class SupportService {
       const ch = (await c.query<{ id: string }>('SELECT id FROM chats WHERE customer_id = $1 AND NOT closed FOR UPDATE', [person.id])).rows[0]!;
       await c.query('INSERT INTO chat_messages (chat_id, from_kind, by_name, body) VALUES ($1,$2,$3,$4)', [ch.id, 'customer', person.name, input.text]);
       await c.query('UPDATE chats SET unread = unread + 1, last_at = now() WHERE id = $1', [ch.id]);
-    });
-    return this.myChat(person.id);
+      return ch.id;
+    }).then((chatId) => this.hub.publish({ chatId, customerId: person.id }));
+    return this.readMyChat(person.id);
   }
 
   // ---- reviews -------------------------------------------------------------------------------------------------------------------------

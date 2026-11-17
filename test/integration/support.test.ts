@@ -171,6 +171,40 @@ describe('live chat', () => {
     expect((await call('GET', '/v1/admin/chats', ruth)).statusCode).toBe(403);
   });
 
+  it('delivers messages the moment they are sent, to the agent and to the customer', async () => {
+    const buyer = uuidv7();
+    const t = await h.token(buyer, ['customer']);
+    await call('POST', '/v1/support/chat/messages', t, { text: 'First' });
+    const list0 = (await call('GET', '/v1/admin/chats', grace)).json() as { items: { id: string; customerId: string }[]; version: string };
+    const chatId = list0.items.find((c) => c.customerId === buyer)!.id;
+    const open0 = (await call('GET', `/v1/admin/chats/${chatId}`, grace)).json() as { version: string };
+
+    // The agent is waiting on the chat and on the list; nothing has changed, so nothing comes back yet.
+    const agentWaits = call('GET', `/v1/admin/chats/${chatId}?v=${open0.version}&wait=5`, grace);
+    const listWaits = call('GET', `/v1/admin/chats?v=${encodeURIComponent(list0.version)}&wait=5`, grace);
+    const t0 = Date.now();
+    await new Promise((r) => setTimeout(r, 150));
+    await call('POST', '/v1/support/chat/messages', t, { text: 'Second' });
+    const [a, l] = await Promise.all([agentWaits, listWaits]);
+    expect(Date.now() - t0).toBeLessThan(2500);
+    expect(a.json().messages.map((m: { text: string }) => m.text)).toEqual(['First', 'Second']);
+    expect(l.json().version).not.toBe(list0.version);
+
+    // The customer waits too, and hears the agent's reply straight away.
+    const mine0 = (await call('GET', '/v1/support/chat', t)).json().chat as { version: string };
+    const customerWaits = call('GET', `/v1/support/chat?v=${mine0.version}&wait=5`, t);
+    const t1 = Date.now();
+    await new Promise((r) => setTimeout(r, 150));
+    await call('POST', `/v1/admin/chats/${chatId}/messages`, grace, { text: 'On it' });
+    const reply = (await customerWaits).json().chat as { messages: { text: string }[] };
+    expect(Date.now() - t1).toBeLessThan(2500);
+    expect(reply.messages.at(-1)!.text).toBe('On it');
+
+    // With nothing new, a wait ends quietly after its time with the same state.
+    const quiet = (await call('GET', `/v1/support/chat?v=${(reply as unknown as { version: string }).version}&wait=1`, t)).json().chat as { messages: unknown[] };
+    expect(quiet.messages).toHaveLength(3);
+  });
+
   it('lets an agent start a chat with a customer', async () => {
     const c = await call('POST', '/v1/admin/chats', grace, { customerId: wanjiku });
     expect(c.statusCode).toBe(201);
