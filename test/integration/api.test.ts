@@ -208,6 +208,20 @@ describe('orders', () => {
     expect(got).toEqual([...ids].reverse());
   });
 
+  it('gives the owner a short-lived link to the receipt as a PDF, and nobody else', async () => {
+    const p = await createProduct(h, { stock: 5 });
+    const o = (await order(p.id, 1)).json();
+    const stranger = { authorization: `Bearer ${await h.token(uuidv7())}` };
+    expect((await h.app.inject({ method: 'POST', url: `/v1/orders/${o.id}/receipt-link`, headers: stranger })).statusCode).toBe(404);
+    const link = (await h.app.inject({ method: 'POST', url: `/v1/orders/${o.id}/receipt-link`, headers: auth })).json() as { url: string };
+    const pdf = await h.app.inject({ method: 'GET', url: link.url });
+    expect(pdf.statusCode).toBe(200);
+    expect(pdf.headers['content-type']).toBe('application/pdf');
+    expect(pdf.rawPayload.subarray(0, 5).toString()).toBe('%PDF-');
+    expect((await h.app.inject({ method: 'GET', url: `/v1/orders/${o.id}/receipt.pdf?t=${link.url.split('t=')[1]}x` })).statusCode).toBe(404);
+    expect((await h.app.inject({ method: 'GET', url: `/v1/orders/${o.id}/receipt.pdf` })).statusCode).toBe(404);
+  });
+
   it('cancels (releasing stock), confirms payment idempotently, and enforces transitions', async () => {
     const p = await createProduct(h, { stock: 10 });
     const o1 = (await order(p.id, 4)).json();

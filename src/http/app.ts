@@ -1,10 +1,11 @@
+import { randomBytes } from 'node:crypto';
 import Fastify, { LogController, type FastifyBaseLogger, type FastifyInstance, type FastifyReply, type FastifyServerOptions, type FastifyRequest } from 'fastify';
 import helmet from '@fastify/helmet';
 import cors from '@fastify/cors';
 import { z } from 'zod';
 import type { Logger } from 'pino';
 import { parseTrustProxy, type Config } from '../config/index.js';
-import { AppError, RateLimitedError, ServiceUnavailableError, ValidationError } from '../domain/errors.js';
+import { AppError, NotFoundError, RateLimitedError, ServiceUnavailableError, ValidationError } from '../domain/errors.js';
 import { authFailures, httpDuration, loadShed, rateLimited } from '../infra/metrics.js';
 import { uuidv7 } from '../infra/uuid.js';
 import { bearer, requirePrincipal, requireRole, type TokenVerifier } from './auth.js';
@@ -56,6 +57,7 @@ import {
   type ProductService,
 } from '../modules/products/products.js';
 import { makeCreateOrderSchema, type OrderService } from '../modules/orders/orders.js';
+import { receiptTokenOk, renderReceipt, signReceiptToken } from '../modules/orders/receipt-pdf.js';
 
 export interface AppDeps {
   cfg: Config;
@@ -363,6 +365,24 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     const { id } = parse(IdParam, req.params);
     reply.header('cache-control', 'private, no-store');
     return deps.orders.get(id, { sub: p.sub, isAdmin: await authz.canAct(req, 'Orders', 'View') });
+  });
+
+  const receiptKey = cfg.STAFF_JWT_PRIVATE_KEY ?? cfg.MPESA_CALLBACK_SECRET ?? randomBytes(32).toString('hex');
+  // The receipt as a PDF. The signed-in customer asks for a link that works for ten minutes; opening it (in a browser or PDF viewer) downloads the file.
+  app.post('/v1/orders/:id/receipt-link', async (req, reply) => {
+    const p = requirePrincipal(req);
+    const { id } = parse(IdParam, req.params);
+    await deps.orders.get(id, { sub: p.sub, isAdmin: await authz.canAct(req, 'Orders', 'View') });
+    reply.header('cache-control', 'private, no-store');
+    return { url: `/v1/orders/${id}/receipt.pdf?t=${signReceiptToken(receiptKey, id)}` };
+  });
+  app.get('/v1/orders/:id/receipt.pdf', async (req, reply) => {
+    const { id } = parse(IdParam, req.params);
+    const t = typeof (req.query as { t?: unknown }).t === 'string' ? (req.query as { t: string }).t : '';
+    if (!receiptTokenOk(receiptKey, id, t)) throw new NotFoundError('Receipt');
+    const order = await deps.orders.get(id, { sub: '', isAdmin: true });
+    const pdf = await renderReceipt(order);
+    return reply.header('content-type', 'application/pdf').header('content-disposition', `attachment; filename="receipt-${order.orderNumber}.pdf"`).header('cache-control', 'private, no-store').send(pdf);
   });
 
   const CancelBody = z.strictObject({ reason: z.string().trim().min(1).max(200).default('customer_request') });

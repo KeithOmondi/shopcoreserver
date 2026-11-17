@@ -56,14 +56,17 @@ const productFields = {
   options: z.record(z.string().max(40), z.union([z.string().max(200), z.number()])).default({}),
 };
 export const AdminCreateProductSchema = z.strictObject({
-  sku: z.string().regex(/^[A-Z0-9][A-Z0-9_-]{0,63}$/), ...productFields,
+  /** Leave out to let the system number it (SC-001234). */
+  sku: z.string().regex(/^[A-Z0-9][A-Z0-9_-]{0,63}$/).optional(), ...productFields,
   initialStock: z.number().int().min(0).max(10_000_000).default(0), locationId: uuid.optional(),
 });
-export const AdminUpdateProductSchema = patchOf(z.strictObject(productFields));
+// SKU and barcode are made by the system and never change, so an update can't carry them.
+const { barcode: _barcode, ...editableFields } = productFields;
+export const AdminUpdateProductSchema = patchOf(z.strictObject(editableFields));
 /** Several variants of one item at once: each is a sellable product with its own SKU, price and stock. */
 export const AddVariantsSchema = z.strictObject({
   variants: z.array(z.strictObject({
-    sku: z.string().regex(/^[A-Z0-9][A-Z0-9_-]{0,63}$/), options: z.record(z.string().max(40), z.union([z.string().max(200), z.number()])),
+    sku: z.string().regex(/^[A-Z0-9][A-Z0-9_-]{0,63}$/).optional(), options: z.record(z.string().max(40), z.union([z.string().max(200), z.number()])),
     priceCents: z.number().int().min(0).max(1_000_000_000_00).optional(), costCents: z.number().int().min(0).optional(), barcode: z.string().trim().max(32).default(''),
     initialStock: z.number().int().min(0).max(10_000_000).default(0),
   })).min(1).max(100),
@@ -355,19 +358,19 @@ export class CatalogService {
         const id = uuidv7();
         await c.query(
           `INSERT INTO products (id, sku, name, description, price_cents, currency, active, category_id, subcategory, brand_id, supplier_id, cost_cents, barcode, tax, track_stock, status, reorder_at, handle, seo_title, seo_desc, variants, specs, options, group_id)
-           SELECT $1, $2, name, description, $3, currency, active, category_id, subcategory, brand_id, supplier_id, $4, $5, tax, track_stock, status, reorder_at, handle, seo_title, seo_desc, '[]'::jsonb, specs, $6, $7 FROM products WHERE id = $8`,
-          [id, v.sku, v.priceCents ?? src.price_cents, v.costCents ?? src.cost_cents, v.barcode, JSON.stringify(clean.options), group, src.id],
+           SELECT $1, COALESCE(NULLIF($2, ''), next_product_sku()), name, description, $3, currency, active, category_id, subcategory, brand_id, supplier_id, $4, COALESCE(NULLIF($5, ''), next_product_barcode()), tax, track_stock, status, reorder_at, handle, seo_title, seo_desc, '[]'::jsonb, specs, $6, $7 FROM products WHERE id = $8`,
+          [id, v.sku ?? '', v.priceCents ?? src.price_cents, v.costCents ?? src.cost_cents, v.barcode, JSON.stringify(clean.options), group, src.id],
         ).catch((e: { code?: string; constraint?: string }) => {
           if (e.code === '23505') {
             if (e.constraint === 'products_group_options_key') throw new ConflictError('VARIANT_EXISTS', 'That combination of options already exists for this product');
-            throw new ConflictError(e.constraint === 'products_barcode_key' ? 'BARCODE_EXISTS' : 'SKU_EXISTS', e.constraint === 'products_barcode_key' ? 'Another product already uses that barcode' : `SKU ${v.sku} already exists`);
+            throw new ConflictError(e.constraint === 'products_barcode_key' ? 'BARCODE_EXISTS' : 'SKU_EXISTS', e.constraint === 'products_barcode_key' ? 'Another product already uses that barcode' : 'That SKU already exists');
           }
           throw e;
         });
         await c.query('INSERT INTO inventory (product_id, available) VALUES ($1, 0)', [id]);
         await c.query('INSERT INTO product_images (product_id, upload_id, position) SELECT $1, upload_id, position FROM product_images WHERE product_id = $2', [id, src.id]);
         if (v.initialStock > 0) await applyMoves(c, [{ productId: id, locationId: primary, delta: v.initialStock, type: 'Opening stock', ref: 'NEW-VARIANT' }], { id: actor.id, name: actor.name ?? 'Staff' });
-        await outbox(c, 'product', id, 'ProductCreated', { id, sku: v.sku, name: src.name });
+        await outbox(c, 'product', id, 'ProductCreated', { id, name: src.name });
         ids.push(id);
       }
       await audit(c, actor, 'product.variants', 'product', sourceId, { added: ids.length });
@@ -415,8 +418,8 @@ export class CatalogService {
       const clean = await this.cleanValues(c, input.categoryId, input.specs, input.options);
       await c.query(
         `INSERT INTO products (id, sku, name, description, price_cents, currency, active, category_id, subcategory, brand_id, supplier_id, cost_cents, barcode, tax, track_stock, status, reorder_at, handle, seo_title, seo_desc, variants, specs, options)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`,
-        [id, input.sku, input.name, input.description, input.priceCents, input.currency, input.status === 'active', input.categoryId, input.subcategory, input.brandId, input.supplierId,
+         VALUES ($1,COALESCE(NULLIF($2, ''), next_product_sku()),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,COALESCE(NULLIF($13, ''), next_product_barcode()),$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`,
+        [id, input.sku ?? '', input.name, input.description, input.priceCents, input.currency, input.status === 'active', input.categoryId, input.subcategory, input.brandId, input.supplierId,
           input.costCents, input.barcode, input.tax, input.trackStock, input.status, input.reorderAt, handle, input.seoTitle, input.seoDesc, JSON.stringify(input.variants), JSON.stringify(clean.specs), JSON.stringify(clean.options)],
       ).catch((e: { code?: string; constraint?: string }) => {
         if (e.code === '23505') throw new ConflictError(e.constraint === 'products_barcode_key' ? 'BARCODE_EXISTS' : 'SKU_EXISTS', e.constraint === 'products_barcode_key' ? 'Another product already uses that barcode' : 'SKU already exists');
@@ -427,7 +430,7 @@ export class CatalogService {
         await applyMoves(c, [{ productId: id, locationId: input.locationId ?? (await primaryLocation(c)), delta: input.initialStock, type: 'Opening stock', ref: 'NEW-PRODUCT' }], { id: actor.id, name: actor.name ?? 'Staff' });
       }
       await audit(c, actor, 'product.create', 'product', id, { ...input, variants: input.variants.length });
-      await outbox(c, 'product', id, 'ProductCreated', { id, sku: input.sku, name: input.name });
+      await outbox(c, 'product', id, 'ProductCreated', { id, name: input.name });
     });
     await this.products.invalidate(id);
     return this.getProduct(id);
@@ -461,7 +464,6 @@ export class CatalogService {
       if (p.brandId !== undefined) set('brand_id', p.brandId);
       if (p.supplierId !== undefined) set('supplier_id', p.supplierId);
       if (p.costCents !== undefined) set('cost_cents', p.costCents);
-      if (p.barcode !== undefined) set('barcode', p.barcode);
       if (p.tax !== undefined) set('tax', p.tax);
       if (p.trackStock !== undefined) set('track_stock', p.trackStock);
       if (p.status !== undefined) { set('status', p.status); set('active', p.status === 'active'); }

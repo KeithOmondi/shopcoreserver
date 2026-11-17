@@ -81,6 +81,21 @@ describe('products', () => {
   });
   const body = (sku: string, over: object = {}) => ({ sku, name: `Product ${sku}`, priceCents: 450_000, costCents: 260_000, categoryId: cat, brandId: brand, supplierId: sup, barcode: '', initialStock: 40, ...over });
 
+  it('numbers a new product itself (SKU and a valid EAN-13 barcode) and refuses to change them later', async () => {
+    const { sku: _s, ...noSku } = body('X');
+    const a = (await call('POST', '/v1/admin/products', inv, { ...noSku, name: 'Auto A' })).json();
+    const b = (await call('POST', '/v1/admin/products', inv, { ...noSku, name: 'Auto B' })).json();
+    expect(a.sku).toMatch(/^SC-\d{6}$/);
+    expect(b.sku).not.toBe(a.sku);
+    for (const code of [a.barcode, b.barcode] as string[]) {
+      expect(code).toMatch(/^200\d{10}$/);
+      const sum = [...code.slice(0, 12)].reduce((n, d, i) => n + Number(d) * (i % 2 ? 3 : 1), 0);
+      expect((10 - (sum % 10)) % 10).toBe(Number(code[12]));
+    }
+    expect(a.barcode).not.toBe(b.barcode);
+    expect((await call('PATCH', `/v1/admin/products/${a.id}`, inv, { barcode: '123' }, { 'if-match': `"${a.version}"` })).statusCode).toBe(400);
+  });
+
   it('creates a product with its stock at the primary location', async () => {
     const r = await call('POST', '/v1/admin/products', inv, body('BAG-1', { barcode: '6160000000011' }));
     expect(r.statusCode).toBe(201);
