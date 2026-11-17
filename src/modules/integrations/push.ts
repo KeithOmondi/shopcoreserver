@@ -33,6 +33,7 @@ export const TEMPLATES = {
   campaign: { kind: 'deals', en: { title: '{title}', body: '{body}' }, sw: { title: '{title}', body: '{body}' } },
   return_update: { kind: 'returns', en: { title: 'Update on your return', body: '{message}' }, sw: { title: 'Taarifa kuhusu kurudisha bidhaa', body: '{message}' } },
   back_in_stock: { kind: 'stock', en: { title: 'Back in stock', body: '{product} is available again.' }, sw: { title: 'Imerudi dukani', body: '{product} inapatikana tena.' } },
+  chat_reply: { kind: 'support', en: { title: 'ShopCore support replied', body: '{text}' }, sw: { title: 'Huduma kwa wateja imejibu', body: '{text}' } },
   referral_points: { kind: 'orders', en: { title: 'You earned reward points', body: '{name} placed their first order. {points} points were added.' }, sw: { title: 'Umepata pointi za zawadi', body: '{name} ameagiza kwa mara ya kwanza. Pointi {points} zimeongezwa.' } },
 } as const satisfies Record<string, { kind: string; en: Text; sw: Text }>;
 export type TemplateId = keyof typeof TEMPLATES;

@@ -5,6 +5,7 @@ import { isUuid, uuidv7 } from '../../infra/uuid.js';
 import { decodeCursor, encodeCursor } from '../../http/pagination.js';
 import { flag, patchOf } from '../../http/validate.js';
 import { audit, type Actor } from '../products/products.js';
+import { queuePush } from '../integrations/push.js';
 import { ChatHub } from './chat-hub.js';
 
 const uuid = z.string().refine(isUuid, 'must be a UUID');
@@ -301,11 +302,13 @@ export class SupportService {
 
   async chatSend(id: string, text: string, actor: Actor) {
     await this.db.tx(async (c) => {
-      const ch = (await c.query<{ closed: boolean }>('SELECT closed FROM chats WHERE id = $1 FOR UPDATE', [id])).rows[0];
+      const ch = (await c.query<{ closed: boolean; customer_id: string }>('SELECT closed, customer_id FROM chats WHERE id = $1 FOR UPDATE', [id])).rows[0];
       if (!ch) throw new NotFoundError('Chat');
       if (ch.closed) throw new UnprocessableError('CHAT_CLOSED', 'This chat has ended');
       await c.query('INSERT INTO chat_messages (chat_id, from_kind, by_name, body) VALUES ($1,$2,$3,$4)', [id, 'agent', actor.name ?? 'Staff', text]);
       await c.query('UPDATE chats SET assignee_id = COALESCE(assignee_id, $2), assignee_name = COALESCE(assignee_name, $3), unread = 0, last_at = now() WHERE id = $1', [id, actor.id, actor.name ?? 'Staff']);
+      // The customer may have closed the app: a push brings them back to the chat.
+      await queuePush(c, { type: 'customer', id: ch.customer_id }, 'chat_reply', { text: text.length > 140 ? `${text.slice(0, 137)}…` : text }, { screen: 'chat' });
     });
     const out = await this.db.read((c) => this.loadChat(c, id));
     this.hub.publish({ chatId: id, customerId: out.customerId });
