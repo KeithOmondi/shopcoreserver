@@ -23,6 +23,7 @@
     "dev:keys": "tsx scripts/dev-keys.ts keys",
     "prod:keys": "tsx scripts/prod-keys.ts",
     "seed:demo": "tsx scripts/seed-demo-shop.ts",
+    "seed:bulk": "tsx scripts/bulk-demo-products.ts",
     "lan": "node scripts/lan-address.mjs",
     "test": "vitest run",
     "test:unit": "vitest run test/unit",
